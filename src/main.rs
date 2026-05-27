@@ -39,13 +39,21 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
 
-        /// Enable AI analysis using DeepSeek API
+        /// Enable AI analysis using the configured chat completion API
         #[arg(long)]
         ai: bool,
 
-        /// DeepSeek API key (or set in ~/.config/bizgraph/config.toml)
+        /// API key (or set in ~/.config/bizgraph/config.toml)
         #[arg(long = "api-key")]
         api_key: Option<String>,
+
+        /// Chat completion API URL override
+        #[arg(long = "api-url")]
+        api_url: Option<String>,
+
+        /// Chat completion model override
+        #[arg(long = "model")]
+        model: Option<String>,
 
         /// Save AI report to file
         #[arg(long = "ai-output")]
@@ -69,6 +77,18 @@ enum Command {
         /// Port to listen on
         #[arg(long, default_value = "3081")]
         port: u16,
+
+        /// API key override for future AI-backed server features
+        #[arg(long = "api-key")]
+        api_key: Option<String>,
+
+        /// Chat completion API URL override for future AI-backed server features
+        #[arg(long = "api-url")]
+        api_url: Option<String>,
+
+        /// Chat completion model override for future AI-backed server features
+        #[arg(long = "model")]
+        model: Option<String>,
     },
 }
 
@@ -94,11 +114,27 @@ enum ProjectAction {
 async fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Command::Analyze { yakit_excel, host, output, summary, pretty, project, ai, api_key, ai_output } => {
+        Command::Analyze {
+            yakit_excel,
+            host,
+            output,
+            summary,
+            pretty,
+            project,
+            ai,
+            api_key,
+            api_url,
+            model,
+            ai_output,
+        } => {
             if let Some(project) = project {
-                let resolved_api_key = if ai {
-                    match bizgraph::load_api_key(api_key.as_deref()) {
-                        Ok(api_key) => Some(api_key),
+                let resolved_ai_config = if ai {
+                    match bizgraph::load_config(
+                        api_key.as_deref(),
+                        model.as_deref(),
+                        api_url.as_deref(),
+                    ) {
+                        Ok(config) => Some(config),
                         Err(error) => {
                             eprintln!("Error: {error}");
                             std::process::exit(1);
@@ -112,7 +148,9 @@ async fn main() {
                     &yakit_excel,
                     host.as_deref(),
                     &project,
-                    resolved_api_key.as_deref(),
+                    resolved_ai_config.as_ref().map(|(api_key, _, _)| api_key.as_str()),
+                    resolved_ai_config.as_ref().map(|(_, model, _)| model.as_str()),
+                    resolved_ai_config.as_ref().map(|(_, _, api_url)| api_url.as_str()),
                 )
                 .await
                 {
@@ -155,11 +193,17 @@ async fn main() {
             }
 
             let graph_result = if ai {
-                match bizgraph::load_api_key(api_key.as_deref()) {
-                    Ok(resolved_api_key) => bizgraph::analyze_with_ai_report(
+                match bizgraph::load_config(
+                    api_key.as_deref(),
+                    model.as_deref(),
+                    api_url.as_deref(),
+                ) {
+                    Ok((resolved_api_key, resolved_model, resolved_api_url)) => bizgraph::analyze_with_ai_report(
                         &yakit_excel,
                         host.as_deref(),
                         &resolved_api_key,
+                        &resolved_model,
+                        &resolved_api_url,
                     )
                     .await
                     .map(|(graph, report)| (graph, Some(report))),
@@ -289,7 +333,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Serve { yakit_excel, host, port } => {
+        Command::Serve { yakit_excel, host, port, api_key: _, api_url: _, model: _ } => {
             if let Err(e) = bizgraph::server::serve_with_graph(&yakit_excel, host.as_deref(), port).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);

@@ -49,14 +49,19 @@ struct ChatMessageContent {
     content: String,
 }
 
-/// Send the business graph to DeepSeek for AI analysis.
+/// Send the business graph to the configured chat completion API for AI analysis.
 /// Returns a Markdown report.
-pub async fn analyze_with_ai(graph: &BusinessGraph, api_key: &str) -> Result<String, String> {
+pub async fn analyze_with_ai(
+    graph: &BusinessGraph,
+    api_key: &str,
+    model: &str,
+    api_url: &str,
+) -> Result<String, String> {
     let graph_json = serde_json::to_string(graph)
         .map_err(|e| format!("Failed to serialize graph: {e}"))?;
 
     let request = ChatRequest {
-        model: "deepseek-v4-flash".to_string(),
+        model: model.to_string(),
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -87,24 +92,24 @@ pub async fn analyze_with_ai(graph: &BusinessGraph, api_key: &str) -> Result<Str
 
     let client = reqwest::Client::new();
     let resp = client
-        .post("https://api.deepseek.com/chat/completions")
+        .post(api_url)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", api_key))
         .json(&request)
         .send()
         .await
-        .map_err(|e| format!("DeepSeek API request failed: {e}"))?;
+        .map_err(|e| format!("AI API request failed: {e}"))?;
 
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("DeepSeek API error ({status}): {body}"));
+        return Err(format!("AI API error ({status}): {body}"));
     }
 
     let chat_resp: ChatResponse = resp
         .json()
         .await
-        .map_err(|e| format!("Failed to parse DeepSeek response: {e}"))?;
+        .map_err(|e| format!("Failed to parse AI response: {e}"))?;
 
     let content = chat_resp
         .choices
