@@ -7,7 +7,7 @@ pub mod types;
 
 use std::{env, fs, path::PathBuf};
 
-use ai::analyze_with_ai;
+use ai::{analyze_with_ai, analyze_with_ai_deep};
 pub use db::Database;
 use graph::build_business_graph;
 use parser::parse_yakit_excel;
@@ -37,9 +37,14 @@ pub async fn analyze_with_ai_report(
     api_key: &str,
     model: &str,
     api_url: &str,
+    deep: bool,
 ) -> Result<(BusinessGraph, String), String> {
     let graph = analyze(yakit_excel_path, host_filter)?;
-    let report = analyze_with_ai(&graph, api_key, model, api_url).await?;
+    let report = if deep {
+        analyze_with_ai_deep(&graph, api_key, model, api_url).await?
+    } else {
+        analyze_with_ai(&graph, api_key, model, api_url).await?
+    };
     Ok((graph, report))
 }
 
@@ -50,6 +55,7 @@ pub async fn analyze_with_project(
     api_key_option: Option<&str>,
     model_option: Option<&str>,
     api_url_option: Option<&str>,
+    deep: bool,
 ) -> Result<AnalysisResult, String> {
     let rows = parse_yakit_excel(yakit_excel_path, host_filter)?;
     let graph = build_business_graph(&rows)?;
@@ -74,13 +80,23 @@ pub async fn analyze_with_project(
     let graph = db.get_graph(project.id)?;
     let ai_report = match api_key_option {
         Some(api_key) => Some(
-            analyze_with_ai(
-                &graph,
-                api_key,
-                model_option.unwrap_or(DEFAULT_MODEL),
-                api_url_option.unwrap_or(DEFAULT_API_URL),
-            )
-            .await?,
+            if deep {
+                analyze_with_ai_deep(
+                    &graph,
+                    api_key,
+                    model_option.unwrap_or(DEFAULT_MODEL),
+                    api_url_option.unwrap_or(DEFAULT_API_URL),
+                )
+                .await?
+            } else {
+                analyze_with_ai(
+                    &graph,
+                    api_key,
+                    model_option.unwrap_or(DEFAULT_MODEL),
+                    api_url_option.unwrap_or(DEFAULT_API_URL),
+                )
+                .await?
+            },
         ),
         None => None,
     };

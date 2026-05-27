@@ -43,6 +43,10 @@ enum Command {
         #[arg(long)]
         ai: bool,
 
+        /// Enable multi-pass AI analysis
+        #[arg(long)]
+        deep: bool,
+
         /// API key (or set in ~/.config/bizgraph/config.toml)
         #[arg(long = "api-key")]
         api_key: Option<String>,
@@ -122,6 +126,7 @@ async fn main() {
             pretty,
             project,
             ai,
+            deep,
             api_key,
             api_url,
             model,
@@ -151,6 +156,7 @@ async fn main() {
                     resolved_ai_config.as_ref().map(|(api_key, _, _)| api_key.as_str()),
                     resolved_ai_config.as_ref().map(|(_, model, _)| model.as_str()),
                     resolved_ai_config.as_ref().map(|(_, _, api_url)| api_url.as_str()),
+                    deep,
                 )
                 .await
                 {
@@ -204,6 +210,7 @@ async fn main() {
                         &resolved_api_key,
                         &resolved_model,
                         &resolved_api_url,
+                        deep,
                     )
                     .await
                     .map(|(graph, report)| (graph, Some(report))),
