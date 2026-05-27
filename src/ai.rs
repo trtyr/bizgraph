@@ -157,23 +157,38 @@ pub async fn analyze_with_ai_deep(
     let function_names = prioritized_function_names(graph, &overview_response);
     let deep_dive_budget = MAX_DEEP_AI_CALLS.saturating_sub(3);
 
+    // Concurrent domain deep-dives — each independent, same base context
+    eprintln!("Turn 2/4: Analyzing {} modules in parallel...", deep_dive_budget.min(function_names.len()));
+    let mut deep_dive_tasks = Vec::new();
     for function_name in function_names.into_iter().take(deep_dive_budget) {
-        eprintln!("Turn 2/4: Analyzing {function_name} module...");
+        let mut history = history.clone();
+        let function_name = function_name.clone();
         let detail = build_function_detail(&function_name, graph);
-        let response = chat_with_history(
-            &mut history,
-            DEEP_DOMAIN_SYSTEM_PROMPT,
-            format!(
-                "Now analyze the following business module in detail:\n\n{}\n\n{}\n\nFocus on security vulnerabilities specific to these endpoints.",
-                function_name, detail
-            ),
-            api_key,
-            model,
-            api_url,
-        )
-        .await?;
+        let api_key = api_key.to_string();
+        let model = model.to_string();
+        let api_url = api_url.to_string();
+        deep_dive_tasks.push(tokio::spawn(async move {
+            eprintln!("  > Analyzing {function_name}...");
+            let response = chat_with_history(
+                &mut history,
+                DEEP_DOMAIN_SYSTEM_PROMPT,
+                format!(
+                    "Now analyze the following business module in detail:\n\n{}\n\n{}\n\nFocus on security vulnerabilities specific to these endpoints.",
+                    function_name, detail
+                ),
+                &api_key,
+                &model,
+                &api_url,
+            )
+            .await?;
+            Ok::<_, String>((function_name, response))
+        }));
+    }
+
+    for task in deep_dive_tasks {
+        let (name, response) = task.await.map_err(|e| format!("Deep dive task panicked: {e}"))??;
+        findings.push((name, response));
         calls_made += 1;
-        findings.push((function_name, response));
     }
 
     eprintln!("Turn 3/4: Cross-domain analysis...");
