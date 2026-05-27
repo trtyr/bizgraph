@@ -57,8 +57,7 @@ pub async fn analyze_with_ai(
     model: &str,
     api_url: &str,
 ) -> Result<String, String> {
-    let graph_json = serde_json::to_string(graph)
-        .map_err(|e| format!("Failed to serialize graph: {e}"))?;
+    let summary = build_graph_summary(graph);
 
     let request = ChatRequest {
         model: model.to_string(),
@@ -70,9 +69,10 @@ pub async fn analyze_with_ai(
             ChatMessage {
                 role: "user".to_string(),
                 content: format!(
-                    "Analyze the following business graph JSON extracted from network traffic.\n\
-                     The graph contains BusinessFunction nodes (grouped by host+path prefix), \
-                     Endpoint nodes (HTTP endpoints), and edges (contains, calls_after, data_dependency).\n\
+                    "Analyze the following structured summary of a business graph extracted from network traffic.\n\
+                     The summary contains BusinessFunction nodes (grouped by host+path prefix), \
+                     Endpoint nodes (HTTP endpoints with methods, status codes, and schemas), \
+                     and edge statistics.\n\
                      \n\
                      Identify:\n\
                      1. What business functions does this application serve?\n\
@@ -82,8 +82,7 @@ pub async fn analyze_with_ai(
                      5. Concrete next steps for deeper testing\n\
                      \n\
                      Respond in Markdown.\n\
-                     \n\
-                     ```json\n{graph_json}\n```"
+                     \n{summary}"
                 ),
             },
         ],
