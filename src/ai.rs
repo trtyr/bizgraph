@@ -33,13 +33,14 @@ Output rules:
 - Be evidence-based: link findings to observed traffic patterns
 - Be actionable: each finding must have a concrete test step
 - Rate severity: Critical > High > Medium > Low > Info
-- If evidence is weak, state confidence level"#;
+- If evidence is weak, state confidence level
+- Respond in natural Markdown with clear headings and concise, evidence-based analysis."#;
 const MAX_DEEP_AI_CALLS: usize = 7;
 const AGENT_STATE_TOKEN_LIMIT: usize = 2_500;
 const TURN_DATA_CHAR_LIMIT: usize = 3_200;
+const TURN_RESPONSE_SUMMARY_THRESHOLD: usize = 8_000;
 const FINDING_SUMMARY_CHAR_LIMIT: usize = 500;
-const CROSS_CUTTING_LIMIT: usize = 8;
-const FINDINGS_PER_RESPONSE_LIMIT: usize = 6;
+const CROSS_CUTTING_LIMIT: usize = 20;
 
 #[derive(Clone, Serialize)]
 struct ChatMessage {
@@ -93,6 +94,14 @@ struct AgentState {
     cross_cutting: Vec<String>,
     progress: Progress,
     token_budget: TokenBudget,
+    turn_responses: Vec<TurnResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TurnResponse {
+    phase: String,
+    domain: Option<String>,
+    content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +186,7 @@ impl AgentState {
                 used: 0,
                 limit: AGENT_STATE_TOKEN_LIMIT,
             },
+            turn_responses: Vec::new(),
         };
         refresh_token_budget(&mut state);
         state
@@ -312,11 +322,13 @@ async fn run_agent(
     let overview_context = build_turn_context(
         &state,
         "OVERVIEW",
-        &compact_turn_data(&build_graph_overview(graph), TURN_DATA_CHAR_LIMIT),
+        &build_graph_overview(graph),
     );
     let overview = chat_fresh(overview_context, api_key, model, api_url).await?;
     calls_made += 1;
+    record_turn(&mut state, "overview", None, &overview);
     update_state_from_overview(graph, &mut state, &overview);
+    parse_findings_into_state(&mut state, None, &overview);
 
     state.phase = "domain".to_string();
     let domain_budget = MAX_DEEP_AI_CALLS.saturating_sub(3);
@@ -329,7 +341,7 @@ async fn run_agent(
     let mut domain_tasks = Vec::new();
     for domain in &selected_domains {
         let name = domain.name.clone();
-        let detail = compact_turn_data(&build_function_detail(&name, graph), TURN_DATA_CHAR_LIMIT);
+        let detail = build_function_detail(&name, graph);
         let context = build_turn_context(&state, "DOMAIN_DEEP_DIVE", &detail);
         let api_key = api_key.to_string();
         let model = model.to_string();
@@ -346,11 +358,13 @@ async fn run_agent(
             .await
             .map_err(|e| format!("Domain deep-dive task panicked: {e}"))??;
         calls_made += 1;
-        compress_into_state(&mut state, &domain, &response);
+        record_turn(&mut state, "domain", Some(&domain), &response);
+        parse_findings_into_state(&mut state, Some(&domain), &response);
     }
 
     state.phase = "cross".to_string();
     eprintln!("Phase 3/4: Cross-domain correlation...");
+    maybe_summarize_context(&mut state, api_key, model, api_url).await?;
     let cross_context = build_turn_context(
         &state,
         "CROSS_DOMAIN",
@@ -358,10 +372,12 @@ async fn run_agent(
     );
     let cross = chat_fresh(cross_context, api_key, model, api_url).await?;
     calls_made += 1;
+    record_turn(&mut state, "cross", None, &cross);
     compress_cross_into_state(&mut state, &cross);
 
     state.phase = "final".to_string();
     eprintln!("Phase 4/4: Final report synthesis...");
+    maybe_summarize_context(&mut state, api_key, model, api_url).await?;
     let final_context = build_turn_context(&state, "FINAL_REPORT", &render_state_for_final(&state));
     let report = chat_fresh(final_context, api_key, model, api_url).await?;
     calls_made += 1;
@@ -372,62 +388,139 @@ async fn run_agent(
         ));
     }
 
-    Ok(report)
+    Ok(extract_final_report(&report))
 }
 
 fn build_turn_context(state: &AgentState, task: &str, data: &str) -> Vec<ChatMessage> {
+    let accumulated = state
+        .turn_responses
+        .iter()
+        .map(|response| {
+            format!(
+                "## {} ({}) Results\n\n{}",
+                response.phase,
+                response.domain.as_deref().unwrap_or("overview"),
+                response.content
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    let context_block = if accumulated.is_empty() {
+        String::new()
+    } else {
+        format!("Previous analysis results:\n\n{}\n\n---\n\n", accumulated)
+    };
+    let char_count = data.chars().count();
+    if char_count > TURN_DATA_CHAR_LIMIT {
+        eprintln!(
+            "Soft warning: task {task} context payload is {char_count} chars, above soft limit {TURN_DATA_CHAR_LIMIT}; keeping full data."
+        );
+    }
+
     vec![
         ChatMessage::system(AGENT_IDENTITY_PROMPT),
-        ChatMessage::system(build_state_summary(state)),
         ChatMessage::user(format!(
-            "Task: {}\n\n{}\n\nRelevant data:\n{}",
-            task,
-            build_task_instruction(task),
-            compact_turn_data(data, TURN_DATA_CHAR_LIMIT)
+            "{context_block}Task: {task}\n\n{}\n\nData:\n{data}",
+            build_task_instruction(task)
         )),
     ]
-}
-
-fn build_state_summary(state: &AgentState) -> String {
-    let analyzed_domains = state.domains.iter().filter(|domain| domain.analyzed).count();
-    let critical_high = state
-        .findings
-        .iter()
-        .filter(|finding| matches!(finding.severity, Severity::Critical | Severity::High))
-        .count();
-
-    format!(
-        "Current analysis state: phase={}, domains_total={}, domains_analyzed={}, findings_total={}, critical_or_high={}, cross_cutting={}, progress_completed={}, progress_remaining={}, token_budget={}/{} tokens.\n\nCompressed state:\n{}",
-        state.phase,
-        state.domains.len(),
-        analyzed_domains,
-        state.findings.len(),
-        critical_high,
-        state.cross_cutting.len(),
-        state.progress.completed.len(),
-        state.progress.remaining.len(),
-        state.token_budget.used,
-        state.token_budget.limit,
-        compact_turn_data(&render_state_snapshot(state), 1_500),
-    )
 }
 
 fn build_task_instruction(task: &str) -> &'static str {
     match task {
         "OVERVIEW" => {
-            "Scan the graph overview, identify business domains, prioritize them by testing value, and explain why the top domains matter. Return concise structured analysis with endpoint-aware observations."
+            "Scan the graph overview, identify business domains, prioritize them by testing value, and explain the business context and initial concerns in natural Markdown. Use exact domain names from the data when listing priorities."
         }
         "DOMAIN_DEEP_DIVE" => {
-            "Analyze this single business domain in isolation. Focus on authentication gaps, IDOR, sensitive data exposure, workflow abuse, dangerous state changes, and practical manual test ideas."
+            "Analyze this single business domain in isolation. Focus on authentication gaps, IDOR, sensitive data exposure, workflow abuse, dangerous state changes, and practical manual test ideas. Return natural Markdown with headings, findings, evidence, affected endpoints, and concrete next tests."
         }
         "CROSS_DOMAIN" => {
-            "Correlate already-compressed domain findings with the topology. Focus on privilege boundaries, data movement, chained workflows, and ways a weakness in one module could affect another."
+            "Correlate the full domain findings with the topology. Focus on privilege boundaries, data movement, chained workflows, and ways a weakness in one module could affect another. Return natural Markdown with cross-domain findings, evidence, and chained attack hypotheses."
         }
         "FINAL_REPORT" => {
-            "Compile the final penetration testing report from the compressed state only. Deduplicate overlapping items, group findings by severity, and keep conclusions tied to observed endpoints and traffic evidence."
+            "Compile the final penetration testing report from the full analysis state. Deduplicate overlapping items, group findings by severity, and keep conclusions tied to observed endpoints and traffic evidence. Return a polished Markdown report suitable for a human reader."
         }
-        _ => "Analyze the supplied business-graph context and respond in concise Markdown.",
+        _ => "Analyze the supplied business-graph context and respond in natural Markdown.",
     }
+}
+
+fn record_turn(state: &mut AgentState, phase: &str, domain: Option<&str>, content: &str) {
+    state.turn_responses.push(TurnResponse {
+        phase: phase.to_string(),
+        domain: domain.map(ToString::to_string),
+        content: content.to_string(),
+    });
+    refresh_token_budget(state);
+}
+
+async fn maybe_summarize_context(
+    state: &mut AgentState,
+    api_key: &str,
+    model: &str,
+    api_url: &str,
+) -> Result<String, String> {
+    let total_chars: usize = state.turn_responses.iter().map(|response| response.content.len()).sum();
+
+    if total_chars < TURN_RESPONSE_SUMMARY_THRESHOLD {
+        return Ok(state
+            .turn_responses
+            .iter()
+            .map(|response| {
+                format!(
+                    "## {} ({})\n\n{}",
+                    response.phase,
+                    response.domain.as_deref().unwrap_or("overview"),
+                    response.content
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n"));
+    }
+
+    let full_history = state
+        .turn_responses
+        .iter()
+        .map(|response| {
+            format!(
+                "## {} - {}\n\n{}",
+                response.phase,
+                response.domain.as_deref().unwrap_or("overview"),
+                response.content
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+
+    let summary_prompt = format!(
+        "Summarize the following penetration testing analysis history into a concise report.\n\
+         Preserve ALL findings, their severity levels, affected endpoints, evidence, and recommendations.\n\
+         Do NOT omit or truncate any security finding.\n\
+         \n{}",
+        full_history
+    );
+
+    let request = ChatRequest {
+        model: model.to_string(),
+        messages: vec![
+            ChatMessage::system("You are a precise technical summarizer. Preserve all security findings, severity levels, endpoints, evidence, and recommendations. Be concise but lose NO information."),
+            ChatMessage::user(summary_prompt),
+        ],
+        stream: false,
+    };
+
+    let summary = send_chat_request(&request, api_key, api_url)
+        .await
+        .map_err(|error| format!("Summarization API request failed: {error}"))?;
+
+    state.turn_responses.clear();
+    state.turn_responses.push(TurnResponse {
+        phase: "summary".to_string(),
+        domain: None,
+        content: summary.clone(),
+    });
+    refresh_token_budget(state);
+
+    Ok(summary)
 }
 
 fn update_state_from_overview(
@@ -435,7 +528,7 @@ fn update_state_from_overview(
     state: &mut AgentState,
     overview_response: &str,
 ) {
-    let prioritized = prioritized_function_names(graph, overview_response);
+    let prioritized = parse_prioritized_domains_from_overview(graph, overview_response);
     if prioritized.is_empty() {
         return;
     }
@@ -460,36 +553,45 @@ fn update_state_from_overview(
     }
 
     state.progress.remaining = state.domains.iter().map(|domain| domain.name.clone()).collect();
-    push_unique(
-        &mut state.cross_cutting,
-        summarize_text(overview_response, FINDING_SUMMARY_CHAR_LIMIT),
-    );
+    let overview_summary = summarize_text(overview_response, FINDING_SUMMARY_CHAR_LIMIT);
+    if !overview_summary.is_empty() {
+        push_unique(&mut state.cross_cutting, overview_summary);
+    }
+    for item in extract_cross_cutting_items(overview_response) {
+        push_unique(&mut state.cross_cutting, item);
+    }
     refresh_token_budget(state);
-    prune_state_to_budget(state);
 }
 
-fn compress_into_state(state: &mut AgentState, domain: &str, response: &str) {
+fn parse_findings_into_state(state: &mut AgentState, domain: Option<&str>, response: &str) {
     let _ = check_budget(state, response, state.token_budget.limit);
+
     let summary = summarize_text(response, FINDING_SUMMARY_CHAR_LIMIT);
     let extracted_findings = parse_findings_from_response(response);
 
-    if let Some(domain_state) = state.domains.iter_mut().find(|item| item.name == domain) {
-        domain_state.analyzed = true;
-        domain_state.findings_summary = Some(summary);
-    }
+    if let Some(domain) = domain {
+        if let Some(domain_state) = state.domains.iter_mut().find(|item| item.name == domain) {
+            domain_state.analyzed = true;
+            domain_state.findings_summary = Some(summary);
+        }
 
-    move_to_completed(&mut state.progress, domain);
+        move_to_completed(&mut state.progress, domain);
+    }
 
     for finding in extracted_findings {
         push_finding(&mut state.findings, finding);
     }
 
+    for item in extract_cross_cutting_items(response) {
+        push_unique(&mut state.cross_cutting, item);
+    }
+
     refresh_token_budget(state);
-    prune_state_to_budget(state);
 }
 
 fn compress_cross_into_state(state: &mut AgentState, response: &str) {
     let _ = check_budget(state, response, state.token_budget.limit);
+
     for item in extract_cross_cutting_items(response) {
         push_unique(&mut state.cross_cutting, item);
     }
@@ -499,21 +601,20 @@ fn compress_cross_into_state(state: &mut AgentState, response: &str) {
     }
 
     refresh_token_budget(state);
-    prune_state_to_budget(state);
 }
 
 fn build_cross_summary(state: &AgentState, graph: &BusinessGraph) -> String {
     format!(
-        "Compressed findings state:\n{}\n\nObserved cross-domain topology:\n{}",
+        "Structured findings state:\n{}\n\nObserved cross-domain topology:\n{}",
         render_state_snapshot(state),
-        compact_turn_data(&build_cross_domain_summary(graph), TURN_DATA_CHAR_LIMIT)
+        build_cross_domain_summary(graph)
     )
 }
 
 fn render_state_snapshot(state: &AgentState) -> String {
     let mut out = String::new();
     out.push_str("Domains:\n");
-    for domain in state.domains.iter().take(8) {
+    for domain in &state.domains {
         out.push_str(&format!(
             "- [{}] {} | endpoints={} | analyzed={} | summary={}\n",
             domain.priority,
@@ -531,7 +632,7 @@ fn render_state_snapshot(state: &AgentState) -> String {
     if state.findings.is_empty() {
         out.push_str("- none\n");
     } else {
-        for finding in state.findings.iter().take(10) {
+        for finding in &state.findings {
             out.push_str(&format!(
                 "- [{}] {} | endpoints={} | evidence={} | recommendation={}\n",
                 finding.severity.as_str(),
@@ -562,7 +663,7 @@ fn render_state_snapshot(state: &AgentState) -> String {
 
 fn render_state_for_final(state: &AgentState) -> String {
     let mut out = String::new();
-    out.push_str("BizGraph compressed analysis state for final report\n\n");
+    out.push_str("BizGraph structured analysis state for final report\n\n");
     out.push_str(&format!(
         "Phase: {}\nToken budget: {}/{}\n\n",
         state.phase, state.token_budget.used, state.token_budget.limit
@@ -612,15 +713,15 @@ fn render_state_for_final(state: &AgentState) -> String {
         join_or_none(&state.progress.completed),
         join_or_none(&state.progress.remaining)
     ));
-    compact_turn_data(&out, TURN_DATA_CHAR_LIMIT)
+    out
 }
 
 fn summarize_text(text: &str, limit: usize) -> String {
     let bullets = extract_key_bullets(text, 4);
     if bullets.is_empty() {
-        compact_turn_data(text, limit)
+        soft_limit_text(text, limit)
     } else {
-        compact_turn_data(&bullets.join(" | "), limit)
+        soft_limit_text(&bullets.join(" | "), limit)
     }
 }
 
@@ -673,14 +774,14 @@ fn parse_findings_from_response(response: &str) -> Vec<Finding> {
     }
 
     let mut findings = Vec::new();
-    for block in blocks.into_iter().take(FINDINGS_PER_RESPONSE_LIMIT) {
+    for block in blocks {
         if !contains_security_signal(&block) {
             continue;
         }
 
         let title = extract_title(&block);
         let severity = Severity::from_text(&block);
-        let evidence = compact_turn_data(&block, 240);
+        let evidence = block.clone();
         let endpoints = extract_endpoints(&block);
         let recommendation = extract_recommendation(&block, &endpoints);
 
@@ -713,7 +814,7 @@ fn extract_cross_cutting_items(response: &str) -> Vec<String> {
             || lowered.contains("workflow")
             || lowered.contains("data flow")
         {
-            items.push(compact_turn_data(&cleaned, 180));
+            items.push(cleaned);
         }
     }
     items.truncate(CROSS_CUTTING_LIMIT);
@@ -766,7 +867,7 @@ fn extract_title(block: &str) -> String {
     if normalized.is_empty() {
         "Finding".to_string()
     } else {
-        compact_turn_data(normalized, 120)
+        normalized.to_string()
     }
 }
 
@@ -780,7 +881,7 @@ fn extract_recommendation(block: &str, endpoints: &[String]) -> String {
             || lowered.contains("check")
             || lowered.contains("replay")
         {
-            return compact_turn_data(&cleaned, 180);
+            return cleaned;
         }
     }
 
@@ -830,23 +931,6 @@ fn extract_endpoints(text: &str) -> Vec<String> {
 
     endpoints.truncate(6);
     endpoints
-}
-
-fn compact_turn_data(text: &str, max_chars: usize) -> String {
-    let compact = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if compact.chars().count() <= max_chars {
-        compact
-    } else {
-        let mut truncated = compact.chars().take(max_chars.saturating_sub(3)).collect::<String>();
-        truncated.push_str("...");
-        truncated
-    }
 }
 
 fn clean_line(line: &str) -> String {
@@ -916,60 +1000,32 @@ fn refresh_token_budget(state: &mut AgentState) {
     state.token_budget.used = estimate_tokens(&serialized);
 }
 
-fn prune_state_to_budget(state: &mut AgentState) {
-    refresh_token_budget(state);
-    if state.token_budget.used <= state.token_budget.limit {
-        return;
-    }
+fn soft_limit_text(text: &str, limit: usize) -> String {
+    let normalized = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
 
-    state.findings
-        .retain(|finding| matches!(finding.severity, Severity::Critical | Severity::High));
-    refresh_token_budget(state);
-    if state.token_budget.used <= state.token_budget.limit {
-        return;
+    let char_count = normalized.chars().count();
+    if char_count > limit {
+        eprintln!(
+            "Soft warning: text block is {char_count} chars, above soft limit {limit}; preserving full content."
+        );
     }
+    normalized
+}
 
-    for domain in &mut state.domains {
-        if let Some(summary) = &domain.findings_summary {
-            domain.findings_summary = Some(compact_turn_data(summary, 220));
-        }
-    }
-    for finding in &mut state.findings {
-        finding.evidence = compact_turn_data(&finding.evidence, 160);
-        finding.recommendation = compact_turn_data(&finding.recommendation, 120);
-        if finding.endpoints.len() > 3 {
-            finding.endpoints.truncate(3);
-        }
-    }
-    if state.cross_cutting.len() > 4 {
-        state.cross_cutting.truncate(4);
-    }
-    for item in &mut state.cross_cutting {
-        *item = compact_turn_data(item, 120);
-    }
-    if state.progress.completed.len() > 8 {
-        state.progress.completed = state
-            .progress
-            .completed
-            .iter()
-            .rev()
-            .take(8)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-    }
-    if state.progress.remaining.len() > 8 {
-        state.progress.remaining.truncate(8);
-    }
+fn parse_prioritized_domains_from_overview(
+    graph: &BusinessGraph,
+    overview_response: &str,
+) -> Vec<String> {
+    prioritized_function_names(graph, overview_response)
+}
 
-    refresh_token_budget(state);
-    if state.token_budget.used > state.token_budget.limit {
-        state.findings.truncate(6);
-        state.domains.truncate(8);
-        refresh_token_budget(state);
-    }
+fn extract_final_report(response: &str) -> String {
+    response.to_string()
 }
 
 fn build_graph_summary(graph: &BusinessGraph) -> String {
