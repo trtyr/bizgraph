@@ -21,19 +21,46 @@ Output requirements:
 - Be specific and evidence-based. Reference endpoint paths, methods, parameters, status patterns, and graph relationships.
 - If evidence is weak, say so explicitly instead of overstating certainty."#;
 
-const DEEP_OVERVIEW_SYSTEM_PROMPT: &str = "You are doing business domain discovery.";
-const DEEP_DOMAIN_SYSTEM_PROMPT: &str =
-    "You are analyzing this specific business module for security vulnerabilities.";
-const DEEP_CROSS_DOMAIN_SYSTEM_PROMPT: &str =
-    "You are analyzing cross-domain security relationships across business modules.";
-const DEEP_FINAL_SYSTEM_PROMPT: &str =
-    "Compile ALL findings into a final structured penetration test report. Merge overlapping findings, deduplicate, prioritize by severity. Format in Markdown with Executive Summary, Business Functions, Security Concerns (grouped by severity), Detailed Findings per Endpoint, Recommended Next Steps.";
+const AGENT_IDENTITY_PROMPT: &str = r#"You are BizGraph Analysis Agent — a penetration tester specializing in traffic-based business logic analysis.
+Your workflow:
+1. OVERVIEW: Scan business functions, identify domains, prioritize
+2. DOMAIN: Per-domain deep dive into endpoints — find auth issues, IDOR, data leaks, injection points
+3. CROSS: Cross-domain correlation — privilege boundaries, data flow between modules
+4. FINAL: Compile comprehensive report
+
+Output rules:
+- Be specific: cite endpoint paths, methods, parameters
+- Be evidence-based: link findings to observed traffic patterns
+- Be actionable: each finding must have a concrete test step
+- Rate severity: Critical > High > Medium > Low > Info
+- If evidence is weak, state confidence level"#;
 const MAX_DEEP_AI_CALLS: usize = 7;
+const AGENT_STATE_TOKEN_LIMIT: usize = 2_500;
+const TURN_DATA_CHAR_LIMIT: usize = 3_200;
+const FINDING_SUMMARY_CHAR_LIMIT: usize = 500;
+const CROSS_CUTTING_LIMIT: usize = 8;
+const FINDINGS_PER_RESPONSE_LIMIT: usize = 6;
 
 #[derive(Clone, Serialize)]
 struct ChatMessage {
     role: String,
     content: String,
+}
+
+impl ChatMessage {
+    fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: "system".to_string(),
+            content: content.into(),
+        }
+    }
+
+    fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: content.into(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -56,6 +83,141 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatMessageContent {
     content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentState {
+    phase: String,
+    domains: Vec<DomainAnalysis>,
+    findings: Vec<Finding>,
+    cross_cutting: Vec<String>,
+    progress: Progress,
+    token_budget: TokenBudget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DomainAnalysis {
+    name: String,
+    priority: u8,
+    endpoint_count: usize,
+    analyzed: bool,
+    findings_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Finding {
+    severity: Severity,
+    title: String,
+    evidence: String,
+    endpoints: Vec<String>,
+    recommendation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Progress {
+    completed: Vec<String>,
+    remaining: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TokenBudget {
+    used: usize,
+    limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+enum Severity {
+    Critical,
+    High,
+    Medium,
+    Low,
+    Info,
+}
+
+impl AgentState {
+    fn new(graph: &BusinessGraph) -> Self {
+        let mut domains: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.properties {
+                BusinessNodeProperties::BusinessFunction(details) => Some((
+                    node.label.clone(),
+                    details.endpoint_count,
+                )),
+                _ => None,
+            })
+            .collect();
+
+        domains.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+        let domain_entries: Vec<_> = domains
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, endpoint_count))| DomainAnalysis {
+                name,
+                priority: (index + 1).min(u8::MAX as usize) as u8,
+                endpoint_count,
+                analyzed: false,
+                findings_summary: None,
+            })
+            .collect();
+
+        let progress = Progress {
+            completed: Vec::new(),
+            remaining: domain_entries.iter().map(|domain| domain.name.clone()).collect(),
+        };
+
+        let mut state = Self {
+            phase: "overview".to_string(),
+            domains: domain_entries,
+            findings: Vec::new(),
+            cross_cutting: Vec::new(),
+            progress,
+            token_budget: TokenBudget {
+                used: 0,
+                limit: AGENT_STATE_TOKEN_LIMIT,
+            },
+        };
+        refresh_token_budget(&mut state);
+        state
+    }
+}
+
+impl Severity {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Critical => "Critical",
+            Self::High => "High",
+            Self::Medium => "Medium",
+            Self::Low => "Low",
+            Self::Info => "Info",
+        }
+    }
+
+    fn rank(&self) -> usize {
+        match self {
+            Self::Critical => 0,
+            Self::High => 1,
+            Self::Medium => 2,
+            Self::Low => 3,
+            Self::Info => 4,
+        }
+    }
+
+    fn from_text(text: &str) -> Self {
+        let lowered = text.to_ascii_lowercase();
+        if lowered.contains("critical") {
+            Self::Critical
+        } else if lowered.contains("high") {
+            Self::High
+        } else if lowered.contains("medium") {
+            Self::Medium
+        } else if lowered.contains("low") {
+            Self::Low
+        } else {
+            Self::Info
+        }
+    }
 }
 
 /// Send the business graph to the configured chat completion API for AI analysis.
@@ -134,93 +296,74 @@ pub async fn analyze_with_ai_deep(
     model: &str,
     api_url: &str,
 ) -> Result<String, String> {
-    let mut history = Vec::new();
-    let mut findings = Vec::new();
+    run_agent(graph, api_key, model, api_url).await
+}
+
+async fn run_agent(
+    graph: &BusinessGraph,
+    api_key: &str,
+    model: &str,
+    api_url: &str,
+) -> Result<String, String> {
+    let mut state = AgentState::new(graph);
     let mut calls_made = 0usize;
 
-    eprintln!("Turn 1/4: Business overview...");
-    let overview_response = chat_with_history(
-        &mut history,
-        DEEP_OVERVIEW_SYSTEM_PROMPT,
-        format!(
-            "Analyze the business graph at a high level. Identify the business domains present and prioritize which modules should be analyzed first.\n\nReturn:\n1. Identified business domains\n2. Prioritized analysis order\n3. Why each prioritized module matters\n\nUse only this overview data for now:\n\n{}",
-            build_graph_overview(graph)
-        ),
-        api_key,
-        model,
-        api_url,
-    )
-    .await?;
+    eprintln!("Phase 1/4: Business overview...");
+    let overview_context = build_turn_context(
+        &state,
+        "OVERVIEW",
+        &compact_turn_data(&build_graph_overview(graph), TURN_DATA_CHAR_LIMIT),
+    );
+    let overview = chat_fresh(overview_context, api_key, model, api_url).await?;
     calls_made += 1;
-    findings.push(("Business overview".to_string(), overview_response.clone()));
+    update_state_from_overview(graph, &mut state, &overview);
 
-    let function_names = prioritized_function_names(graph, &overview_response);
-    let deep_dive_budget = MAX_DEEP_AI_CALLS.saturating_sub(3);
+    state.phase = "domain".to_string();
+    let domain_budget = MAX_DEEP_AI_CALLS.saturating_sub(3);
+    let selected_domains: Vec<_> = state.domains.iter().take(domain_budget).cloned().collect();
 
-    // Concurrent domain deep-dives — each independent, same base context
-    eprintln!("Turn 2/4: Analyzing {} modules in parallel...", deep_dive_budget.min(function_names.len()));
-    let mut deep_dive_tasks = Vec::new();
-    for function_name in function_names.into_iter().take(deep_dive_budget) {
-        let mut history = history.clone();
-        let function_name = function_name.clone();
-        let detail = build_function_detail(&function_name, graph);
+    eprintln!(
+        "Phase 2/4: Deep-diving {} prioritized domains in parallel...",
+        selected_domains.len()
+    );
+    let mut domain_tasks = Vec::new();
+    for domain in &selected_domains {
+        let name = domain.name.clone();
+        let detail = compact_turn_data(&build_function_detail(&name, graph), TURN_DATA_CHAR_LIMIT);
+        let context = build_turn_context(&state, "DOMAIN_DEEP_DIVE", &detail);
         let api_key = api_key.to_string();
         let model = model.to_string();
         let api_url = api_url.to_string();
-        deep_dive_tasks.push(tokio::spawn(async move {
-            eprintln!("  > Analyzing {function_name}...");
-            let response = chat_with_history(
-                &mut history,
-                DEEP_DOMAIN_SYSTEM_PROMPT,
-                format!(
-                    "Now analyze the following business module in detail:\n\n{}\n\n{}\n\nFocus on security vulnerabilities specific to these endpoints.",
-                    function_name, detail
-                ),
-                &api_key,
-                &model,
-                &api_url,
-            )
-            .await?;
-            Ok::<_, String>((function_name, response))
+        domain_tasks.push(tokio::spawn(async move {
+            eprintln!("  > Analyzing domain: {name}");
+            let response = chat_fresh(context, &api_key, &model, &api_url).await?;
+            Ok::<_, String>((name, response))
         }));
     }
 
-    for task in deep_dive_tasks {
-        let (name, response) = task.await.map_err(|e| format!("Deep dive task panicked: {e}"))??;
-        findings.push((name, response));
+    for task in domain_tasks {
+        let (domain, response) = task
+            .await
+            .map_err(|e| format!("Domain deep-dive task panicked: {e}"))??;
         calls_made += 1;
+        compress_into_state(&mut state, &domain, &response);
     }
 
-    eprintln!("Turn 3/4: Cross-domain analysis...");
-    let cross_domain_response = chat_with_history(
-        &mut history,
-        DEEP_CROSS_DOMAIN_SYSTEM_PROMPT,
-        format!(
-            "Review the business-module findings below together with the cross-domain topology. Identify cross-cutting concerns such as auth bypass across domains, data leakage between modules, and privilege escalation paths.\n\nFindings so far:\n\n{}\n\nCross-domain topology:\n\n{}",
-            format_findings(&findings),
-            build_cross_domain_summary(graph)
-        ),
-        api_key,
-        model,
-        api_url,
-    )
-    .await?;
+    state.phase = "cross".to_string();
+    eprintln!("Phase 3/4: Cross-domain correlation...");
+    let cross_context = build_turn_context(
+        &state,
+        "CROSS_DOMAIN",
+        &build_cross_summary(&state, graph),
+    );
+    let cross = chat_fresh(cross_context, api_key, model, api_url).await?;
     calls_made += 1;
-    findings.push(("Cross-domain".to_string(), cross_domain_response));
+    compress_cross_into_state(&mut state, &cross);
 
-    eprintln!("Turn 4/4: Final report synthesis...");
-    let final_response = chat_with_history(
-        &mut history,
-        DEEP_FINAL_SYSTEM_PROMPT,
-        format!(
-            "Compile ALL findings into the final report. Use the accumulated findings below, merge overlaps, deduplicate, and prioritize by severity.\n\n{}",
-            format_findings(&findings)
-        ),
-        api_key,
-        model,
-        api_url,
-    )
-    .await?;
+    state.phase = "final".to_string();
+    eprintln!("Phase 4/4: Final report synthesis...");
+    let final_context = build_turn_context(&state, "FINAL_REPORT", &render_state_for_final(&state));
+    let report = chat_fresh(final_context, api_key, model, api_url).await?;
     calls_made += 1;
 
     if calls_made > MAX_DEEP_AI_CALLS {
@@ -229,7 +372,604 @@ pub async fn analyze_with_ai_deep(
         ));
     }
 
-    Ok(final_response)
+    Ok(report)
+}
+
+fn build_turn_context(state: &AgentState, task: &str, data: &str) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::system(AGENT_IDENTITY_PROMPT),
+        ChatMessage::system(build_state_summary(state)),
+        ChatMessage::user(format!(
+            "Task: {}\n\n{}\n\nRelevant data:\n{}",
+            task,
+            build_task_instruction(task),
+            compact_turn_data(data, TURN_DATA_CHAR_LIMIT)
+        )),
+    ]
+}
+
+fn build_state_summary(state: &AgentState) -> String {
+    let analyzed_domains = state.domains.iter().filter(|domain| domain.analyzed).count();
+    let critical_high = state
+        .findings
+        .iter()
+        .filter(|finding| matches!(finding.severity, Severity::Critical | Severity::High))
+        .count();
+
+    format!(
+        "Current analysis state: phase={}, domains_total={}, domains_analyzed={}, findings_total={}, critical_or_high={}, cross_cutting={}, progress_completed={}, progress_remaining={}, token_budget={}/{} tokens.\n\nCompressed state:\n{}",
+        state.phase,
+        state.domains.len(),
+        analyzed_domains,
+        state.findings.len(),
+        critical_high,
+        state.cross_cutting.len(),
+        state.progress.completed.len(),
+        state.progress.remaining.len(),
+        state.token_budget.used,
+        state.token_budget.limit,
+        compact_turn_data(&render_state_snapshot(state), 1_500),
+    )
+}
+
+fn build_task_instruction(task: &str) -> &'static str {
+    match task {
+        "OVERVIEW" => {
+            "Scan the graph overview, identify business domains, prioritize them by testing value, and explain why the top domains matter. Return concise structured analysis with endpoint-aware observations."
+        }
+        "DOMAIN_DEEP_DIVE" => {
+            "Analyze this single business domain in isolation. Focus on authentication gaps, IDOR, sensitive data exposure, workflow abuse, dangerous state changes, and practical manual test ideas."
+        }
+        "CROSS_DOMAIN" => {
+            "Correlate already-compressed domain findings with the topology. Focus on privilege boundaries, data movement, chained workflows, and ways a weakness in one module could affect another."
+        }
+        "FINAL_REPORT" => {
+            "Compile the final penetration testing report from the compressed state only. Deduplicate overlapping items, group findings by severity, and keep conclusions tied to observed endpoints and traffic evidence."
+        }
+        _ => "Analyze the supplied business-graph context and respond in concise Markdown.",
+    }
+}
+
+fn update_state_from_overview(
+    graph: &BusinessGraph,
+    state: &mut AgentState,
+    overview_response: &str,
+) {
+    let prioritized = prioritized_function_names(graph, overview_response);
+    if prioritized.is_empty() {
+        return;
+    }
+
+    let order: BTreeMap<_, _> = prioritized
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index))
+        .collect();
+
+    state.domains.sort_by(|left, right| {
+        let left_rank = order.get(&left.name).copied().unwrap_or(usize::MAX);
+        let right_rank = order.get(&right.name).copied().unwrap_or(usize::MAX);
+        left_rank
+            .cmp(&right_rank)
+            .then_with(|| right.endpoint_count.cmp(&left.endpoint_count))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    for (index, domain) in state.domains.iter_mut().enumerate() {
+        domain.priority = (index + 1).min(u8::MAX as usize) as u8;
+    }
+
+    state.progress.remaining = state.domains.iter().map(|domain| domain.name.clone()).collect();
+    push_unique(
+        &mut state.cross_cutting,
+        summarize_text(overview_response, FINDING_SUMMARY_CHAR_LIMIT),
+    );
+    refresh_token_budget(state);
+    prune_state_to_budget(state);
+}
+
+fn compress_into_state(state: &mut AgentState, domain: &str, response: &str) {
+    let _ = check_budget(state, response, state.token_budget.limit);
+    let summary = summarize_text(response, FINDING_SUMMARY_CHAR_LIMIT);
+    let extracted_findings = parse_findings_from_response(response);
+
+    if let Some(domain_state) = state.domains.iter_mut().find(|item| item.name == domain) {
+        domain_state.analyzed = true;
+        domain_state.findings_summary = Some(summary);
+    }
+
+    move_to_completed(&mut state.progress, domain);
+
+    for finding in extracted_findings {
+        push_finding(&mut state.findings, finding);
+    }
+
+    refresh_token_budget(state);
+    prune_state_to_budget(state);
+}
+
+fn compress_cross_into_state(state: &mut AgentState, response: &str) {
+    let _ = check_budget(state, response, state.token_budget.limit);
+    for item in extract_cross_cutting_items(response) {
+        push_unique(&mut state.cross_cutting, item);
+    }
+
+    for finding in parse_findings_from_response(response) {
+        push_finding(&mut state.findings, finding);
+    }
+
+    refresh_token_budget(state);
+    prune_state_to_budget(state);
+}
+
+fn build_cross_summary(state: &AgentState, graph: &BusinessGraph) -> String {
+    format!(
+        "Compressed findings state:\n{}\n\nObserved cross-domain topology:\n{}",
+        render_state_snapshot(state),
+        compact_turn_data(&build_cross_domain_summary(graph), TURN_DATA_CHAR_LIMIT)
+    )
+}
+
+fn render_state_snapshot(state: &AgentState) -> String {
+    let mut out = String::new();
+    out.push_str("Domains:\n");
+    for domain in state.domains.iter().take(8) {
+        out.push_str(&format!(
+            "- [{}] {} | endpoints={} | analyzed={} | summary={}\n",
+            domain.priority,
+            domain.name,
+            domain.endpoint_count,
+            domain.analyzed,
+            domain
+                .findings_summary
+                .as_deref()
+                .unwrap_or("pending")
+        ));
+    }
+
+    out.push_str("\nFindings:\n");
+    if state.findings.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for finding in state.findings.iter().take(10) {
+            out.push_str(&format!(
+                "- [{}] {} | endpoints={} | evidence={} | recommendation={}\n",
+                finding.severity.as_str(),
+                finding.title,
+                join_or_none(&finding.endpoints),
+                finding.evidence,
+                finding.recommendation
+            ));
+        }
+    }
+
+    out.push_str("\nCross-cutting:\n");
+    if state.cross_cutting.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for item in state.cross_cutting.iter().take(CROSS_CUTTING_LIMIT) {
+            out.push_str(&format!("- {}\n", item));
+        }
+    }
+
+    out.push_str(&format!(
+        "\nProgress:\n- completed: {}\n- remaining: {}\n",
+        join_or_none(&state.progress.completed),
+        join_or_none(&state.progress.remaining)
+    ));
+    out
+}
+
+fn render_state_for_final(state: &AgentState) -> String {
+    let mut out = String::new();
+    out.push_str("BizGraph compressed analysis state for final report\n\n");
+    out.push_str(&format!(
+        "Phase: {}\nToken budget: {}/{}\n\n",
+        state.phase, state.token_budget.used, state.token_budget.limit
+    ));
+    out.push_str("Business domains:\n");
+    for domain in &state.domains {
+        out.push_str(&format!(
+            "- priority={} | {} | endpoints={} | analyzed={} | summary={}\n",
+            domain.priority,
+            domain.name,
+            domain.endpoint_count,
+            domain.analyzed,
+            domain
+                .findings_summary
+                .as_deref()
+                .unwrap_or("pending")
+        ));
+    }
+
+    out.push_str("\nStructured findings:\n");
+    if state.findings.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for finding in &state.findings {
+            out.push_str(&format!(
+                "- severity={} | title={} | endpoints={} | evidence={} | recommendation={}\n",
+                finding.severity.as_str(),
+                finding.title,
+                join_or_none(&finding.endpoints),
+                finding.evidence,
+                finding.recommendation
+            ));
+        }
+    }
+
+    out.push_str("\nCross-cutting observations:\n");
+    if state.cross_cutting.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for item in &state.cross_cutting {
+            out.push_str(&format!("- {}\n", item));
+        }
+    }
+
+    out.push_str(&format!(
+        "\nProgress summary:\n- completed: {}\n- remaining: {}\n",
+        join_or_none(&state.progress.completed),
+        join_or_none(&state.progress.remaining)
+    ));
+    compact_turn_data(&out, TURN_DATA_CHAR_LIMIT)
+}
+
+fn summarize_text(text: &str, limit: usize) -> String {
+    let bullets = extract_key_bullets(text, 4);
+    if bullets.is_empty() {
+        compact_turn_data(text, limit)
+    } else {
+        compact_turn_data(&bullets.join(" | "), limit)
+    }
+}
+
+fn extract_key_bullets(text: &str, limit: usize) -> Vec<String> {
+    text.lines()
+        .map(clean_line)
+        .filter(|line| {
+            !line.is_empty()
+                && (line.starts_with("- ")
+                    || line.starts_with("* ")
+                    || line.starts_with("1. ")
+                    || line.starts_with("2. ")
+                    || line.starts_with("3. ")
+                    || line.contains("critical")
+                    || line.contains("high")
+                    || line.contains("idor")
+                    || line.contains("auth")
+                    || line.contains("privilege"))
+        })
+        .take(limit)
+        .collect()
+}
+
+fn parse_findings_from_response(response: &str) -> Vec<Finding> {
+    let mut blocks = Vec::new();
+    let mut current = String::new();
+
+    for raw_line in response.lines() {
+        let line = raw_line.trim();
+        let starts_new_block = line.starts_with("##")
+            || line.starts_with("###")
+            || line.starts_with("####")
+            || (line.starts_with("- ") && contains_security_signal(line));
+
+        if starts_new_block && !current.trim().is_empty() {
+            blocks.push(current.trim().to_string());
+            current.clear();
+        }
+
+        if !line.is_empty() {
+            if !current.is_empty() {
+                current.push('\n');
+            }
+            current.push_str(line);
+        }
+    }
+
+    if !current.trim().is_empty() {
+        blocks.push(current.trim().to_string());
+    }
+
+    let mut findings = Vec::new();
+    for block in blocks.into_iter().take(FINDINGS_PER_RESPONSE_LIMIT) {
+        if !contains_security_signal(&block) {
+            continue;
+        }
+
+        let title = extract_title(&block);
+        let severity = Severity::from_text(&block);
+        let evidence = compact_turn_data(&block, 240);
+        let endpoints = extract_endpoints(&block);
+        let recommendation = extract_recommendation(&block, &endpoints);
+
+        findings.push(Finding {
+            severity,
+            title,
+            evidence,
+            endpoints,
+            recommendation,
+        });
+    }
+
+    findings
+}
+
+fn extract_cross_cutting_items(response: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    for line in response.lines() {
+        let cleaned = clean_line(line);
+        if cleaned.is_empty() {
+            continue;
+        }
+
+        let lowered = cleaned.to_ascii_lowercase();
+        if lowered.contains("cross")
+            || lowered.contains("privilege")
+            || lowered.contains("shared")
+            || lowered.contains("session")
+            || lowered.contains("token")
+            || lowered.contains("workflow")
+            || lowered.contains("data flow")
+        {
+            items.push(compact_turn_data(&cleaned, 180));
+        }
+    }
+    items.truncate(CROSS_CUTTING_LIMIT);
+    items
+}
+
+fn contains_security_signal(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    [
+        "critical",
+        "high",
+        "medium",
+        "low",
+        "idor",
+        "auth",
+        "authorization",
+        "privilege",
+        "leak",
+        "exposure",
+        "inject",
+        "bypass",
+        "csrf",
+        "ssrf",
+        "refund",
+        "payment",
+        "state change",
+        "workflow",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn extract_title(block: &str) -> String {
+    let first_line = block.lines().next().unwrap_or("Finding");
+    let cleaned = clean_line(first_line)
+        .trim_start_matches('#')
+        .trim_start_matches('-')
+        .trim()
+        .to_string();
+
+    let without_severity = ["Critical", "High", "Medium", "Low", "Info"]
+        .iter()
+        .fold(cleaned, |title, severity| title.replace(severity, ""));
+
+    let normalized = without_severity
+        .trim_start_matches(':')
+        .trim_start_matches('-')
+        .trim();
+
+    if normalized.is_empty() {
+        "Finding".to_string()
+    } else {
+        compact_turn_data(normalized, 120)
+    }
+}
+
+fn extract_recommendation(block: &str, endpoints: &[String]) -> String {
+    for line in block.lines() {
+        let cleaned = clean_line(line);
+        let lowered = cleaned.to_ascii_lowercase();
+        if lowered.contains("test")
+            || lowered.contains("verify")
+            || lowered.contains("attempt")
+            || lowered.contains("check")
+            || lowered.contains("replay")
+        {
+            return compact_turn_data(&cleaned, 180);
+        }
+    }
+
+    if endpoints.is_empty() {
+        "Manually validate authorization, object ownership, and state transitions using the highlighted business workflow.".to_string()
+    } else {
+        format!(
+            "Manually verify authorization and workflow integrity on {}.",
+            join_or_none(endpoints)
+        )
+    }
+}
+
+fn extract_endpoints(text: &str) -> Vec<String> {
+    const HTTP_METHODS: [&str; 9] = [
+        "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE", "CONNECT",
+    ];
+
+    let mut endpoints = Vec::new();
+    for line in text.lines() {
+        let normalized = line.replace(['(', ')', '[', ']', ',', ';'], " ");
+        let tokens: Vec<_> = normalized.split_whitespace().collect();
+        let mut path_candidate = None;
+        let mut method_candidate = None;
+
+        for token in &tokens {
+            let cleaned = token.trim_matches(|ch: char| ch == '.' || ch == ':' || ch == '"');
+            if cleaned.starts_with('/') && path_candidate.is_none() {
+                path_candidate = Some(cleaned.to_string());
+            }
+
+            let upper = cleaned.to_ascii_uppercase();
+            if HTTP_METHODS.contains(&upper.as_str()) && method_candidate.is_none() {
+                method_candidate = Some(upper);
+            }
+        }
+
+        if let Some(path) = path_candidate {
+            let endpoint = if let Some(method) = method_candidate {
+                format!("{} {}", method, path)
+            } else {
+                path
+            };
+            push_unique(&mut endpoints, endpoint);
+        }
+    }
+
+    endpoints.truncate(6);
+    endpoints
+}
+
+fn compact_turn_data(text: &str, max_chars: usize) -> String {
+    let compact = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if compact.chars().count() <= max_chars {
+        compact
+    } else {
+        let mut truncated = compact.chars().take(max_chars.saturating_sub(3)).collect::<String>();
+        truncated.push_str("...");
+        truncated
+    }
+}
+
+fn clean_line(line: &str) -> String {
+    line.trim()
+        .trim_start_matches("- ")
+        .trim_start_matches("* ")
+        .trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.' || ch == ')')
+        .trim()
+        .to_string()
+}
+
+fn join_or_none(items: &[String]) -> String {
+    if items.is_empty() {
+        "none".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+fn move_to_completed(progress: &mut Progress, domain: &str) {
+    if !progress.completed.iter().any(|item| item == domain) {
+        progress.completed.push(domain.to_string());
+    }
+    progress.remaining.retain(|item| item != domain);
+}
+
+fn push_unique(items: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !items.iter().any(|item| item == &value) {
+        items.push(value);
+    }
+}
+
+fn push_finding(findings: &mut Vec<Finding>, finding: Finding) {
+    let duplicate = findings.iter().any(|existing| {
+        existing.title.eq_ignore_ascii_case(&finding.title)
+            && existing.evidence.eq_ignore_ascii_case(&finding.evidence)
+    });
+
+    if !duplicate {
+        findings.push(finding);
+        findings.sort_by(|left, right| {
+            left.severity
+                .rank()
+                .cmp(&right.severity.rank())
+                .then_with(|| left.title.cmp(&right.title))
+        });
+    }
+}
+
+fn estimate_tokens(text: &str) -> usize {
+    text.len() / 4
+}
+
+fn check_budget(state: &AgentState, new_text: &str, limit: usize) -> Result<(), String> {
+    let projected = state.token_budget.used + estimate_tokens(new_text);
+    if projected > limit {
+        Err(format!(
+            "agent state token budget would be exceeded: {projected} > {limit}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn refresh_token_budget(state: &mut AgentState) {
+    let serialized = serde_json::to_string(state).unwrap_or_default();
+    state.token_budget.used = estimate_tokens(&serialized);
+}
+
+fn prune_state_to_budget(state: &mut AgentState) {
+    refresh_token_budget(state);
+    if state.token_budget.used <= state.token_budget.limit {
+        return;
+    }
+
+    state.findings
+        .retain(|finding| matches!(finding.severity, Severity::Critical | Severity::High));
+    refresh_token_budget(state);
+    if state.token_budget.used <= state.token_budget.limit {
+        return;
+    }
+
+    for domain in &mut state.domains {
+        if let Some(summary) = &domain.findings_summary {
+            domain.findings_summary = Some(compact_turn_data(summary, 220));
+        }
+    }
+    for finding in &mut state.findings {
+        finding.evidence = compact_turn_data(&finding.evidence, 160);
+        finding.recommendation = compact_turn_data(&finding.recommendation, 120);
+        if finding.endpoints.len() > 3 {
+            finding.endpoints.truncate(3);
+        }
+    }
+    if state.cross_cutting.len() > 4 {
+        state.cross_cutting.truncate(4);
+    }
+    for item in &mut state.cross_cutting {
+        *item = compact_turn_data(item, 120);
+    }
+    if state.progress.completed.len() > 8 {
+        state.progress.completed = state
+            .progress
+            .completed
+            .iter()
+            .rev()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+    }
+    if state.progress.remaining.len() > 8 {
+        state.progress.remaining.truncate(8);
+    }
+
+    refresh_token_budget(state);
+    if state.token_budget.used > state.token_budget.limit {
+        state.findings.truncate(6);
+        state.domains.truncate(8);
+        refresh_token_budget(state);
+    }
 }
 
 fn build_graph_summary(graph: &BusinessGraph) -> String {
@@ -788,50 +1528,19 @@ fn prioritized_function_names(graph: &BusinessGraph, overview_response: &str) ->
     prioritized.into_iter().take(5).map(|(label, _)| label).collect()
 }
 
-fn format_findings(findings: &[(String, String)]) -> String {
-    let mut out = String::new();
-    for (title, content) in findings {
-        out.push_str(&format!("## {}\n{}\n\n", title, content));
-    }
-    out
-}
-
-async fn chat_with_history(
-    history: &mut Vec<ChatMessage>,
-    system_prompt: &str,
-    user_content: String,
+async fn chat_fresh(
+    messages: Vec<ChatMessage>,
     api_key: &str,
     model: &str,
     api_url: &str,
 ) -> Result<String, String> {
-    let mut messages = history.clone();
-    messages.push(ChatMessage {
-        role: "system".to_string(),
-        content: system_prompt.to_string(),
-    });
-    messages.push(ChatMessage {
-        role: "user".to_string(),
-        content: user_content.clone(),
-    });
-
     let request = ChatRequest {
         model: model.to_string(),
         messages,
         stream: false,
     };
 
-    let content = send_chat_request(&request, api_key, api_url).await?;
-
-    history.push(ChatMessage {
-        role: "user".to_string(),
-        content: user_content,
-    });
-    history.push(ChatMessage {
-        role: "assistant".to_string(),
-        content: content.clone(),
-    });
-
-    Ok(content)
+    send_chat_request(&request, api_key, api_url).await
 }
 
 async fn send_chat_request(
