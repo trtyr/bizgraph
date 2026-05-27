@@ -38,7 +38,10 @@ Output rules:
 const MAX_DEEP_AI_CALLS: usize = 7;
 const AGENT_STATE_TOKEN_LIMIT: usize = 2_500;
 const TURN_DATA_CHAR_LIMIT: usize = 3_200;
-const TURN_RESPONSE_SUMMARY_THRESHOLD: usize = 8_000;
+/// Threshold before triggering LLM summarization (in characters).
+/// Target: ~50% of 200K token context window.
+/// Chinese text: 1 char ≈ 0.5-1 token → 200K chars ≈ 100K-200K tokens.
+const TURN_RESPONSE_SUMMARY_THRESHOLD: usize = 200_000;
 const FINDING_SUMMARY_CHAR_LIMIT: usize = 500;
 const CROSS_CUTTING_LIMIT: usize = 20;
 
