@@ -1,0 +1,24 @@
+[package]
+name = "bizgraph"
+version = "0.1.0"
+edition = "2021"
+description = "Turn Yakit Excel traffic into a deterministic business graph"
+license = "MIT"
+repository = "https://github.com/trtyr/bizgraph"
+keywords = ["pentesting", "security", "traffic-analysis", "business-graph"]
+
+[lib]
+name = "bizgraph"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bizgraph"
+path = "src/main.rs"
+
+[dependencies]
+calamine = "0.26"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v5", "serde"] }
