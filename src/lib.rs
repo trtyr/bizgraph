@@ -1,14 +1,17 @@
 pub mod ai;
+pub mod db;
 pub mod graph;
 pub mod parser;
+pub mod server;
 pub mod types;
 
 use std::{env, fs, path::PathBuf};
 
 use ai::analyze_with_ai;
+pub use db::Database;
 use graph::build_business_graph;
 use parser::parse_yakit_excel;
-use types::BusinessGraph;
+use types::{AnalysisResult, BusinessGraph};
 
 #[derive(serde::Deserialize)]
 struct Config {
@@ -29,6 +32,46 @@ pub async fn analyze_with_ai_report(
     let graph = analyze(yakit_excel_path, host_filter)?;
     let report = analyze_with_ai(&graph, api_key).await?;
     Ok((graph, report))
+}
+
+pub async fn analyze_with_project(
+    yakit_excel_path: &str,
+    host_filter: Option<&str>,
+    project_name_or_id: &str,
+    api_key_option: Option<&str>,
+) -> Result<AnalysisResult, String> {
+    let rows = parse_yakit_excel(yakit_excel_path, host_filter)?;
+    let graph = build_business_graph(&rows)?;
+
+    let db = Database::open_default()?;
+    let project = match db.resolve_project(project_name_or_id)? {
+        Some(project) => project,
+        None => db.create_project(project_name_or_id)?,
+    };
+
+    let stats = db.merge_graph(project.id, &graph)?;
+    let mut stats = stats;
+    stats.row_count = rows.len();
+    db.record_analysis(
+        project.id,
+        Some(yakit_excel_path),
+        host_filter,
+        rows.len(),
+        &stats,
+    )?;
+
+    let graph = db.get_graph(project.id)?;
+    let ai_report = match api_key_option {
+        Some(api_key) => Some(analyze_with_ai(&graph, api_key).await?),
+        None => None,
+    };
+
+    Ok(AnalysisResult {
+        project,
+        graph,
+        stats,
+        ai_report,
+    })
 }
 
 pub fn load_api_key(cli_api_key: Option<&str>) -> Result<String, String> {

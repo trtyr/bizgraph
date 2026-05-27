@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -168,4 +169,42 @@ pub fn default_properties() -> serde_json::Value {
 
 pub fn deterministic_id(stable_key: &str) -> Uuid {
     Uuid::new_v5(&STABLE_ID_NAMESPACE, stable_key.as_bytes())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AnalysisStats {
+    pub row_count: usize,
+    pub new_nodes: usize,
+    pub updated_nodes: usize,
+    pub new_edges: usize,
+    pub skipped_edges: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisRecord {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub excel_path: Option<String>,
+    pub host_filter: Option<String>,
+    pub row_count: usize,
+    pub new_nodes: usize,
+    pub updated_nodes: usize,
+    pub new_edges: usize,
+    pub skipped_edges: usize,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisResult {
+    pub project: Project,
+    pub graph: BusinessGraph,
+    pub stats: AnalysisStats,
+    pub ai_report: Option<String>,
 }

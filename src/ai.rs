@@ -52,7 +52,8 @@ struct ChatMessageContent {
 /// Send the business graph to DeepSeek for AI analysis.
 /// Returns a Markdown report.
 pub async fn analyze_with_ai(graph: &BusinessGraph, api_key: &str) -> Result<String, String> {
-    let summary = build_graph_summary(graph);
+    let graph_json = serde_json::to_string(graph)
+        .map_err(|e| format!("Failed to serialize graph: {e}"))?;
 
     let request = ChatRequest {
         model: "deepseek-v4-flash".to_string(),
@@ -63,7 +64,22 @@ pub async fn analyze_with_ai(graph: &BusinessGraph, api_key: &str) -> Result<Str
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: summary,
+                content: format!(
+                    "Analyze the following business graph JSON extracted from network traffic.\n\
+                     The graph contains BusinessFunction nodes (grouped by host+path prefix), \
+                     Endpoint nodes (HTTP endpoints), and edges (contains, calls_after, data_dependency).\n\
+                     \n\
+                     Identify:\n\
+                     1. What business functions does this application serve?\n\
+                     2. What's the user flow / navigation pattern?\n\
+                     3. Potential security issues (exposed admin endpoints, missing auth, IDOR, sensitive data leak, etc.)\n\
+                     4. High-value targets for manual penetration testing\n\
+                     5. Concrete next steps for deeper testing\n\
+                     \n\
+                     Respond in Markdown.\n\
+                     \n\
+                     ```json\n{graph_json}\n```"
+                ),
             },
         ],
         stream: false,
