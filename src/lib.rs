@@ -55,7 +55,7 @@ pub async fn analyze_with_project(
     api_key_option: Option<&str>,
     model_option: Option<&str>,
     api_url_option: Option<&str>,
-    deep: bool,
+    ai_report: Option<&str>,
 ) -> Result<AnalysisResult, String> {
     let rows = parse_yakit_excel(yakit_excel_path, host_filter)?;
     let graph = build_business_graph(&rows)?;
@@ -69,37 +69,29 @@ pub async fn analyze_with_project(
     let stats = db.merge_graph(project.id, &graph)?;
     let mut stats = stats;
     stats.row_count = rows.len();
+    let graph = db.get_graph(project.id)?;
+    let ai_report = match (ai_report, api_key_option) {
+        (Some(report), _) => Some(report.to_string()),
+        (None, Some(api_key)) => Some(
+            analyze_with_ai_deep(
+                &graph,
+                api_key,
+                model_option.unwrap_or(DEFAULT_MODEL),
+                api_url_option.unwrap_or(DEFAULT_API_URL),
+            )
+            .await?,
+        ),
+        (None, None) => None,
+    };
+
     db.record_analysis(
         project.id,
         Some(yakit_excel_path),
         host_filter,
+        ai_report.as_deref(),
         rows.len(),
         &stats,
     )?;
-
-    let graph = db.get_graph(project.id)?;
-    let ai_report = match api_key_option {
-        Some(api_key) => Some(
-            if deep {
-                analyze_with_ai_deep(
-                    &graph,
-                    api_key,
-                    model_option.unwrap_or(DEFAULT_MODEL),
-                    api_url_option.unwrap_or(DEFAULT_API_URL),
-                )
-                .await?
-            } else {
-                analyze_with_ai(
-                    &graph,
-                    api_key,
-                    model_option.unwrap_or(DEFAULT_MODEL),
-                    api_url_option.unwrap_or(DEFAULT_API_URL),
-                )
-                .await?
-            },
-        ),
-        None => None,
-    };
 
     Ok(AnalysisResult {
         project,
@@ -109,23 +101,14 @@ pub async fn analyze_with_project(
     })
 }
 
-pub fn load_config(
-    cli_api_key: Option<&str>,
-    cli_model: Option<&str>,
-    cli_api_url: Option<&str>,
-) -> Result<(String, String, String), String> {
+pub fn load_config() -> Result<(String, String, String), String> {
     let home_config = read_config_from_path(config_path_in_home())?;
     let local_config = read_config_from_path(PathBuf::from("bizgraph.toml"))?;
 
-    let api_key = cli_api_key
+    let api_key = home_config
+        .as_ref()
+        .and_then(|config| config.deepseek_api_key.as_deref())
         .and_then(normalize_config_value)
-        .or_else(|| env::var("BIZGRAPH_DEEPSEEK_API_KEY").ok().and_then(|value| normalize_config_value(&value)))
-        .or_else(|| {
-            home_config
-                .as_ref()
-                .and_then(|config| config.deepseek_api_key.as_deref())
-                .and_then(normalize_config_value)
-        })
         .or_else(|| {
             local_config
                 .as_ref()
@@ -133,17 +116,13 @@ pub fn load_config(
                 .and_then(normalize_config_value)
         })
         .ok_or_else(|| {
-            "API key not found. Pass --api-key, set BIZGRAPH_DEEPSEEK_API_KEY, or configure deepseek_api_key in ~/.config/bizgraph/config.toml or ./bizgraph.toml".to_string()
+            "API key not found. Configure deepseek_api_key in ~/.config/bizgraph/config.toml or ./bizgraph.toml".to_string()
         })?;
 
-    let model = cli_model
+    let model = home_config
+        .as_ref()
+        .and_then(|config| config.model.as_deref())
         .and_then(normalize_config_value)
-        .or_else(|| {
-            home_config
-                .as_ref()
-                .and_then(|config| config.model.as_deref())
-                .and_then(normalize_config_value)
-        })
         .or_else(|| {
             local_config
                 .as_ref()
@@ -152,14 +131,10 @@ pub fn load_config(
         })
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
-    let api_url = cli_api_url
+    let api_url = home_config
+        .as_ref()
+        .and_then(|config| config.api_url.as_deref())
         .and_then(normalize_config_value)
-        .or_else(|| {
-            home_config
-                .as_ref()
-                .and_then(|config| config.api_url.as_deref())
-                .and_then(normalize_config_value)
-        })
         .or_else(|| {
             local_config
                 .as_ref()
@@ -171,8 +146,8 @@ pub fn load_config(
     Ok((api_key, model, api_url))
 }
 
-pub fn load_api_key(cli_api_key: Option<&str>) -> Result<String, String> {
-    load_config(cli_api_key, None, None).map(|(api_key, _, _)| api_key)
+pub fn load_api_key() -> Result<String, String> {
+    load_config().map(|(api_key, _, _)| api_key)
 }
 
 fn config_path_in_home() -> PathBuf {

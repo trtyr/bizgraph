@@ -5,14 +5,13 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::types::{
-    AnalysisRecord, AnalysisStats, BusinessEdge, BusinessGraph,
-    BusinessNode, BusinessNodeKind, BusinessNodeProperties, EndpointProperties, ParameterDescriptor,
-    ParameterKind, Project,
+    AnalysisRecord, AnalysisStats, BusinessEdge, BusinessGraph, BusinessNode, BusinessNodeKind,
+    BusinessNodeProperties, EndpointProperties, ParameterDescriptor, ParameterKind, Project,
 };
 
 pub struct Database {
@@ -25,7 +24,8 @@ impl Database {
     }
 
     pub fn open(path: PathBuf) -> Result<Self, String> {
-        let conn = Connection::open(path).map_err(|e| format!("failed to open bizgraph database: {e}"))?;
+        let conn =
+            Connection::open(path).map_err(|e| format!("failed to open bizgraph database: {e}"))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
@@ -61,14 +61,17 @@ impl Database {
                  excel_path TEXT,
                  host_filter TEXT,
                  row_count INTEGER NOT NULL DEFAULT 0,
-                 new_nodes INTEGER NOT NULL DEFAULT 0,
-                 updated_nodes INTEGER NOT NULL DEFAULT 0,
-                 new_edges INTEGER NOT NULL DEFAULT 0,
-                 skipped_edges INTEGER NOT NULL DEFAULT 0,
-                 created_at TEXT NOT NULL
-             );",
+                  new_nodes INTEGER NOT NULL DEFAULT 0,
+                  updated_nodes INTEGER NOT NULL DEFAULT 0,
+                  new_edges INTEGER NOT NULL DEFAULT 0,
+                  skipped_edges INTEGER NOT NULL DEFAULT 0,
+                  ai_report TEXT,
+                  created_at TEXT NOT NULL
+              );",
         )
         .map_err(|e| format!("failed to initialize bizgraph database: {e}"))?;
+
+        ensure_analysis_ai_report_column(&conn)?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -203,9 +206,15 @@ impl Database {
 
         let now = Utc::now().to_rfc3339();
         if let Some(existing_properties) = existing {
-            let existing_properties: BusinessNodeProperties = serde_json::from_str(&existing_properties)
-                .map_err(|e| format!("failed to parse stored node properties for '{}': {e}", node.stable_key))?;
-            let merged_properties = merge_node_properties(existing_properties, node.properties.clone());
+            let existing_properties: BusinessNodeProperties =
+                serde_json::from_str(&existing_properties).map_err(|e| {
+                    format!(
+                        "failed to parse stored node properties for '{}': {e}",
+                        node.stable_key
+                    )
+                })?;
+            let merged_properties =
+                merge_node_properties(existing_properties, node.properties.clone());
 
             self.c()
                 .execute(
@@ -215,8 +224,9 @@ impl Database {
                     params![
                         node.label,
                         node_kind_as_str(&node.kind),
-                        serde_json::to_string(&merged_properties)
-                            .map_err(|e| format!("failed to serialize merged node properties: {e}"))?,
+                        serde_json::to_string(&merged_properties).map_err(|e| format!(
+                            "failed to serialize merged node properties: {e}"
+                        ))?,
                         now,
                         project_id.to_string(),
                         node.stable_key,
@@ -291,7 +301,11 @@ impl Database {
         Ok(true)
     }
 
-    pub fn merge_graph(&self, project_id: Uuid, graph: &BusinessGraph) -> Result<AnalysisStats, String> {
+    pub fn merge_graph(
+        &self,
+        project_id: Uuid,
+        graph: &BusinessGraph,
+    ) -> Result<AnalysisStats, String> {
         let mut stats = AnalysisStats::default();
 
         for node in &graph.nodes {
@@ -365,6 +379,7 @@ impl Database {
         project_id: Uuid,
         excel_path: Option<&str>,
         host_filter: Option<&str>,
+        ai_report: Option<&str>,
         row_count: usize,
         stats: &AnalysisStats,
     ) -> Result<AnalysisRecord, String> {
@@ -373,6 +388,7 @@ impl Database {
             project_id,
             excel_path: excel_path.map(ToString::to_string),
             host_filter: host_filter.map(ToString::to_string),
+            ai_report: ai_report.map(ToString::to_string),
             row_count,
             new_nodes: stats.new_nodes,
             updated_nodes: stats.updated_nodes,
@@ -384,18 +400,19 @@ impl Database {
         self.c()
             .execute(
                 "INSERT INTO analyses
-                 (id, project_id, excel_path, host_filter, row_count, new_nodes, updated_nodes, new_edges, skipped_edges, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (id, project_id, excel_path, host_filter, row_count, new_nodes, updated_nodes, new_edges, skipped_edges, ai_report, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     record.id.to_string(),
                     record.project_id.to_string(),
-                    record.excel_path,
-                    record.host_filter,
+                    record.excel_path.as_deref(),
+                    record.host_filter.as_deref(),
                     record.row_count as i64,
                     record.new_nodes as i64,
                     record.updated_nodes as i64,
                     record.new_edges as i64,
                     record.skipped_edges as i64,
+                    record.ai_report.as_deref(),
                     record.created_at.to_rfc3339(),
                 ],
             )
@@ -404,11 +421,26 @@ impl Database {
         Ok(record)
     }
 
+    pub fn get_latest_analysis(&self, project_id: Uuid) -> Result<Option<AnalysisRecord>, String> {
+        self.c()
+            .query_row(
+                "SELECT id, project_id, excel_path, host_filter, ai_report, row_count, new_nodes, updated_nodes, new_edges, skipped_edges, created_at
+                 FROM analyses
+                 WHERE project_id = ?1
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+                params![project_id.to_string()],
+                analysis_record_from_row,
+            )
+            .optional()
+            .map_err(|e| format!("failed to fetch latest analysis: {e}"))
+    }
+
     pub fn get_analysis_history(&self, project_id: Uuid) -> Result<Vec<AnalysisRecord>, String> {
         let conn = self.c();
         let mut stmt = conn
             .prepare(
-                "SELECT id, project_id, excel_path, host_filter, row_count, new_nodes, updated_nodes, new_edges, skipped_edges, created_at
+                "SELECT id, project_id, excel_path, host_filter, ai_report, row_count, new_nodes, updated_nodes, new_edges, skipped_edges, created_at
                  FROM analyses
                  WHERE project_id = ?1
                  ORDER BY created_at ASC",
@@ -448,7 +480,9 @@ impl Database {
 
             let mut counts = Vec::new();
             for row in rows {
-                counts.push(row.map_err(|e| format!("failed to decode business function count: {e}"))?);
+                counts.push(
+                    row.map_err(|e| format!("failed to decode business function count: {e}"))?,
+                );
             }
             counts
         };
@@ -488,7 +522,9 @@ impl Database {
     }
 
     fn c(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -496,7 +532,8 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
         id: parse_uuid_field(row.get::<_, String>(0)?).map_err(to_sql_conversion_error)?,
         name: row.get(1)?,
-        created_at: parse_datetime_field(row.get::<_, String>(2)?).map_err(to_sql_conversion_error)?,
+        created_at: parse_datetime_field(row.get::<_, String>(2)?)
+            .map_err(to_sql_conversion_error)?,
     })
 }
 
@@ -514,8 +551,10 @@ fn business_node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BusinessN
 fn business_edge_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BusinessEdge> {
     Ok(BusinessEdge {
         id: parse_uuid_field(row.get::<_, String>(0)?).map_err(to_sql_conversion_error)?,
-        source_node_id: parse_uuid_field(row.get::<_, String>(1)?).map_err(to_sql_conversion_error)?,
-        target_node_id: parse_uuid_field(row.get::<_, String>(2)?).map_err(to_sql_conversion_error)?,
+        source_node_id: parse_uuid_field(row.get::<_, String>(1)?)
+            .map_err(to_sql_conversion_error)?,
+        target_node_id: parse_uuid_field(row.get::<_, String>(2)?)
+            .map_err(to_sql_conversion_error)?,
         label: row.get(3)?,
         properties: serde_json::from_str(&row.get::<_, String>(4)?)
             .map_err(to_sql_conversion_error)?,
@@ -528,13 +567,40 @@ fn analysis_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Analysi
         project_id: parse_uuid_field(row.get::<_, String>(1)?).map_err(to_sql_conversion_error)?,
         excel_path: row.get(2)?,
         host_filter: row.get(3)?,
-        row_count: row.get::<_, i64>(4)?.max(0) as usize,
-        new_nodes: row.get::<_, i64>(5)?.max(0) as usize,
-        updated_nodes: row.get::<_, i64>(6)?.max(0) as usize,
-        new_edges: row.get::<_, i64>(7)?.max(0) as usize,
-        skipped_edges: row.get::<_, i64>(8)?.max(0) as usize,
-        created_at: parse_datetime_field(row.get::<_, String>(9)?).map_err(to_sql_conversion_error)?,
+        ai_report: row.get(4)?,
+        row_count: row.get::<_, i64>(5)?.max(0) as usize,
+        new_nodes: row.get::<_, i64>(6)?.max(0) as usize,
+        updated_nodes: row.get::<_, i64>(7)?.max(0) as usize,
+        new_edges: row.get::<_, i64>(8)?.max(0) as usize,
+        skipped_edges: row.get::<_, i64>(9)?.max(0) as usize,
+        created_at: parse_datetime_field(row.get::<_, String>(10)?)
+            .map_err(to_sql_conversion_error)?,
     })
+}
+
+fn ensure_analysis_ai_report_column(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(analyses)")
+        .map_err(|e| format!("failed to inspect analyses schema: {e}"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| format!("failed to read analyses schema: {e}"))?;
+
+    let mut has_ai_report = false;
+    for column in columns {
+        if column.map_err(|e| format!("failed to decode analyses schema row: {e}"))? == "ai_report"
+        {
+            has_ai_report = true;
+            break;
+        }
+    }
+
+    if !has_ai_report {
+        conn.execute("ALTER TABLE analyses ADD COLUMN ai_report TEXT", [])
+            .map_err(|e| format!("failed to migrate analyses.ai_report: {e}"))?;
+    }
+
+    Ok(())
 }
 
 fn parse_uuid_field(value: String) -> Result<Uuid, String> {
@@ -551,7 +617,10 @@ fn to_sql_conversion_error(error: impl ToString) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
         0,
         rusqlite::types::Type::Text,
-        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())),
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error.to_string(),
+        )),
     )
 }
 
@@ -612,7 +681,8 @@ fn merge_endpoint_properties(
     other_status.dedup();
 
     let parameters = merge_parameters(existing.parameters, incoming.parameters);
-    let normalization_notes = merge_sorted_unique(existing.normalization_notes, incoming.normalization_notes);
+    let normalization_notes =
+        merge_sorted_unique(existing.normalization_notes, incoming.normalization_notes);
 
     let mut merged = EndpointProperties {
         path_template: if incoming.path_template.is_empty() {
@@ -628,8 +698,10 @@ fn merge_endpoint_properties(
         status_profiles: crate::types::StatusProfiles {
             success: existing.status_profiles.success + incoming.status_profiles.success,
             redirect: existing.status_profiles.redirect + incoming.status_profiles.redirect,
-            client_error: existing.status_profiles.client_error + incoming.status_profiles.client_error,
-            server_error: existing.status_profiles.server_error + incoming.status_profiles.server_error,
+            client_error: existing.status_profiles.client_error
+                + incoming.status_profiles.client_error,
+            server_error: existing.status_profiles.server_error
+                + incoming.status_profiles.server_error,
             other: other_status,
         },
         confidence: 0.0,
@@ -689,13 +761,38 @@ fn parameter_kind_rank(kind: &ParameterKind) -> usize {
 
 fn recalculate_endpoint_confidence(properties: &EndpointProperties) -> f64 {
     let method_score = (properties.methods.len().min(3) as f64 / 3.0) * 0.25;
-    let request_schema_score = if properties.request_schema.is_some() { 0.2 } else { 0.0 };
-    let response_schema_score = if properties.response_schema.is_some() { 0.2 } else { 0.0 };
-    let parameter_score = if properties.parameters.is_empty() { 0.0 } else { 0.15 };
-    let status_score = if properties.status_codes.is_empty() { 0.0 } else { 0.1 };
-    let notes_score = if properties.normalization_notes.is_empty() { 0.0 } else { 0.1 };
+    let request_schema_score = if properties.request_schema.is_some() {
+        0.2
+    } else {
+        0.0
+    };
+    let response_schema_score = if properties.response_schema.is_some() {
+        0.2
+    } else {
+        0.0
+    };
+    let parameter_score = if properties.parameters.is_empty() {
+        0.0
+    } else {
+        0.15
+    };
+    let status_score = if properties.status_codes.is_empty() {
+        0.0
+    } else {
+        0.1
+    };
+    let notes_score = if properties.normalization_notes.is_empty() {
+        0.0
+    } else {
+        0.1
+    };
 
-    (method_score + request_schema_score + response_schema_score + parameter_score + status_score + notes_score)
+    (method_score
+        + request_schema_score
+        + response_schema_score
+        + parameter_score
+        + status_score
+        + notes_score)
         .clamp(0.0, 1.0)
 }
 
@@ -705,7 +802,10 @@ fn merge_sorted_unique<T: Ord>(existing: Vec<T>, incoming: Vec<T>) -> Vec<T> {
     values.into_iter().collect()
 }
 
-fn _merge_host_properties(existing: BTreeMap<String, Value>, incoming: BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+fn _merge_host_properties(
+    existing: BTreeMap<String, Value>,
+    incoming: BTreeMap<String, Value>,
+) -> BTreeMap<String, Value> {
     let mut merged = existing;
     for (key, value) in incoming {
         merged.insert(key, value);

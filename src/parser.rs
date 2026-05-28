@@ -180,7 +180,11 @@ fn extract_port_from_url(url: &str) -> Option<u16> {
     }
 
     if let Some(port_text) = authority.rsplit_once(':').map(|(_, port)| port) {
-        if !port_text.is_empty() && port_text.chars().all(|character| character.is_ascii_digit()) {
+        if !port_text.is_empty()
+            && port_text
+                .chars()
+                .all(|character| character.is_ascii_digit())
+        {
             if let Ok(port) = port_text.parse::<u16>() {
                 return Some(port);
             }
@@ -254,13 +258,19 @@ mod tests {
 
         let parsed = parse_http_packet(packet);
 
-        assert_eq!(parsed.headers, "Host: example.com\r\nContent-Type: application/json");
+        assert_eq!(
+            parsed.headers,
+            "Host: example.com\r\nContent-Type: application/json"
+        );
         assert_eq!(parsed.body, "{\"ok\":true}");
     }
 
     #[test]
     fn splits_query_from_real_path_column() {
-        let (path, query) = split_path_and_query("/common.js?sv=20260228", "https://example.com/common.js?sv=20260228");
+        let (path, query) = split_path_and_query(
+            "/common.js?sv=20260228",
+            "https://example.com/common.js?sv=20260228",
+        );
 
         assert_eq!(path, "/common.js");
         assert_eq!(query.as_deref(), Some("sv=20260228"));
@@ -268,8 +278,17 @@ mod tests {
 
     #[test]
     fn falls_back_to_default_port_from_scheme() {
-        assert_eq!(extract_port_from_url("https://career.cmbc.com.cn/common.js"), Some(443));
-        assert_eq!(extract_port_from_url("http://career.cmbc.com.cn/common.js"), Some(80));
-        assert_eq!(extract_port_from_url("https://career.cmbc.com.cn:8443/common.js"), Some(8443));
+        assert_eq!(
+            extract_port_from_url("https://career.cmbc.com.cn/common.js"),
+            Some(443)
+        );
+        assert_eq!(
+            extract_port_from_url("http://career.cmbc.com.cn/common.js"),
+            Some(80)
+        );
+        assert_eq!(
+            extract_port_from_url("https://career.cmbc.com.cn:8443/common.js"),
+            Some(8443)
+        );
     }
 }

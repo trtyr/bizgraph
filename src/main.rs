@@ -1,11 +1,15 @@
 use std::collections::BTreeMap;
 
-use clap::{Parser, Subcommand};
 use bizgraph;
+use clap::{Parser, Subcommand};
 use serde_json;
 
 #[derive(Parser)]
-#[command(name = "bizgraph", about = "Yakit traffic → Business graph mapper", version)]
+#[command(
+    name = "bizgraph",
+    about = "Yakit traffic → Business graph mapper",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -16,83 +20,24 @@ enum Command {
     /// Analyze Yakit Excel traffic and produce a business graph
     Analyze {
         /// Path to Yakit Excel file (.xlsx)
-        #[arg(long = "yakit-excel", short = 'f')]
         yakit_excel: String,
 
-        /// Filter traffic by Host column value (prefix match)
+        /// Project name — if set, persist to DB and show summary
+        #[arg(long = "project", short = 'p')]
+        project: Option<String>,
+
+        /// Filter traffic by Host column (prefix match)
         #[arg(long = "host", short = 'H')]
         host: Option<String>,
 
-        /// Output path for JSON graph (stdout if not set)
-        #[arg(long = "output", short = 'o')]
-        output: Option<String>,
-
-        /// Preview only — print summary, don't output full graph
-        #[arg(long)]
-        summary: bool,
-
-        /// Pretty-print JSON output
-        #[arg(long)]
-        pretty: bool,
-
-        /// Import into a named or existing project (supports prefix and UUID resolution)
-        #[arg(long)]
-        project: Option<String>,
-
-        /// Enable AI analysis using the configured chat completion API
+        /// Enable AI business analysis (saved to project DB)
         #[arg(long)]
         ai: bool,
-
-        /// Enable multi-pass AI analysis
-        #[arg(long)]
-        deep: bool,
-
-        /// API key (or set in ~/.config/bizgraph/config.toml)
-        #[arg(long = "api-key")]
-        api_key: Option<String>,
-
-        /// Chat completion API URL override
-        #[arg(long = "api-url")]
-        api_url: Option<String>,
-
-        /// Chat completion model override
-        #[arg(long = "model")]
-        model: Option<String>,
-
-        /// Save AI report to file
-        #[arg(long = "ai-output")]
-        ai_output: Option<String>,
     },
     /// Manage persisted graph projects
     Project {
         #[command(subcommand)]
         action: ProjectAction,
-    },
-    /// Start web server with business graph visualization
-    Serve {
-        /// Path to Yakit Excel file (.xlsx)
-        #[arg(long = "yakit-excel", short = 'f')]
-        yakit_excel: String,
-
-        /// Filter traffic by Host column value (prefix match)
-        #[arg(long = "host", short = 'H')]
-        host: Option<String>,
-
-        /// Port to listen on
-        #[arg(long, default_value = "3081")]
-        port: u16,
-
-        /// API key override for future AI-backed server features
-        #[arg(long = "api-key")]
-        api_key: Option<String>,
-
-        /// Chat completion API URL override for future AI-backed server features
-        #[arg(long = "api-url")]
-        api_url: Option<String>,
-
-        /// Chat completion model override for future AI-backed server features
-        #[arg(long = "model")]
-        model: Option<String>,
     },
 }
 
@@ -121,24 +66,12 @@ async fn main() {
         Command::Analyze {
             yakit_excel,
             host,
-            output,
-            summary,
-            pretty,
             project,
             ai,
-            deep,
-            api_key,
-            api_url,
-            model,
-            ai_output,
         } => {
             if let Some(project) = project {
                 let resolved_ai_config = if ai {
-                    match bizgraph::load_config(
-                        api_key.as_deref(),
-                        model.as_deref(),
-                        api_url.as_deref(),
-                    ) {
+                    match bizgraph::load_config() {
                         Ok(config) => Some(config),
                         Err(error) => {
                             eprintln!("Error: {error}");
@@ -153,42 +86,26 @@ async fn main() {
                     &yakit_excel,
                     host.as_deref(),
                     &project,
-                    resolved_ai_config.as_ref().map(|(api_key, _, _)| api_key.as_str()),
-                    resolved_ai_config.as_ref().map(|(_, model, _)| model.as_str()),
-                    resolved_ai_config.as_ref().map(|(_, _, api_url)| api_url.as_str()),
-                    deep,
+                    resolved_ai_config
+                        .as_ref()
+                        .map(|(api_key, _, _)| api_key.as_str()),
+                    resolved_ai_config
+                        .as_ref()
+                        .map(|(_, model, _)| model.as_str()),
+                    resolved_ai_config
+                        .as_ref()
+                        .map(|(_, _, api_url)| api_url.as_str()),
+                    None,
                 )
                 .await
                 {
                     Ok(result) => {
-                        if summary {
-                            print_project_import_summary(&result.project.name, &result.graph, &result.stats);
-                            write_ai_output(result.ai_report, ai_output.as_deref());
-                            return;
-                        }
-
-                        let json = if pretty {
-                            serde_json::to_string_pretty(&result.graph).unwrap()
-                        } else {
-                            serde_json::to_string(&result.graph).unwrap()
-                        };
-                        if let Some(path) = output {
-                            std::fs::write(&path, json).expect("Failed to write output");
-                            eprintln!("Written merged project graph to {path}");
-                        } else {
-                            println!("{json}");
-                        }
-
-                        eprintln!(
-                            "Project '{}' updated: {} new nodes, {} updated nodes, {} new edges, {} skipped edges from {} rows",
-                            result.project.name,
-                            result.stats.new_nodes,
-                            result.stats.updated_nodes,
-                            result.stats.new_edges,
-                            result.stats.skipped_edges,
-                            result.stats.row_count,
+                        print_project_import_summary(
+                            &result.project.name,
+                            &result.graph,
+                            &result.stats,
                         );
-                        write_ai_output(result.ai_report, ai_output.as_deref());
+                        print_ai_preview(result.ai_report.as_deref());
                     }
                     Err(error) => {
                         eprintln!("Error: {error}");
@@ -199,21 +116,19 @@ async fn main() {
             }
 
             let graph_result = if ai {
-                match bizgraph::load_config(
-                    api_key.as_deref(),
-                    model.as_deref(),
-                    api_url.as_deref(),
-                ) {
-                    Ok((resolved_api_key, resolved_model, resolved_api_url)) => bizgraph::analyze_with_ai_report(
-                        &yakit_excel,
-                        host.as_deref(),
-                        &resolved_api_key,
-                        &resolved_model,
-                        &resolved_api_url,
-                        deep,
-                    )
-                    .await
-                    .map(|(graph, report)| (graph, Some(report))),
+                match bizgraph::load_config() {
+                    Ok((resolved_api_key, resolved_model, resolved_api_url)) => {
+                        bizgraph::analyze_with_ai_report(
+                            &yakit_excel,
+                            host.as_deref(),
+                            &resolved_api_key,
+                            &resolved_model,
+                            &resolved_api_url,
+                            true,
+                        )
+                        .await
+                        .map(|(graph, report)| (graph, Some(report)))
+                    }
                     Err(e) => Err(e),
                 }
             } else {
@@ -223,24 +138,8 @@ async fn main() {
             match graph_result {
                 Ok(graph) => {
                     let (graph, ai_report) = graph;
-                    if summary {
-                        print_graph_summary(&graph);
-                        write_ai_output(ai_report, ai_output.as_deref());
-                        return;
-                    }
-                    let json = if pretty {
-                        serde_json::to_string_pretty(&graph).unwrap()
-                    } else {
-                        serde_json::to_string(&graph).unwrap()
-                    };
-                    if let Some(path) = output {
-                        std::fs::write(&path, json).expect("Failed to write output");
-                        eprintln!("Written to {path}");
-                    } else {
-                        println!("{json}");
-                    }
-
-                    write_ai_output(ai_report, ai_output.as_deref());
+                    println!("{}", serde_json::to_string(&graph).unwrap());
+                    print_ai_report(ai_report.as_deref());
                 }
                 Err(e) => {
                     eprintln!("Error: {e}");
@@ -296,6 +195,9 @@ async fn main() {
                             last.skipped_edges,
                         );
                     }
+                    if let Some(latest) = db.get_latest_analysis(project.id)? {
+                        print_ai_preview(latest.ai_report.as_deref());
+                    }
                     Ok(())
                 }),
                 ProjectAction::History { name } => resolve_project(&db, &name).and_then(|project| {
@@ -341,16 +243,13 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Serve { yakit_excel, host, port, api_key: _, api_url: _, model: _ } => {
-            if let Err(e) = bizgraph::server::serve_with_graph(&yakit_excel, host.as_deref(), port).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
     }
 }
 
-fn resolve_project(db: &bizgraph::Database, name_or_id: &str) -> Result<bizgraph::types::Project, String> {
+fn resolve_project(
+    db: &bizgraph::Database,
+    name_or_id: &str,
+) -> Result<bizgraph::types::Project, String> {
     db.resolve_project(name_or_id)?
         .ok_or_else(|| format!("project '{}' not found", name_or_id))
 }
@@ -395,13 +294,15 @@ fn node_counts(graph: &bizgraph::types::BusinessGraph) -> BTreeMap<&'static str,
     counts
 }
 
-fn write_ai_output(report: Option<String>, ai_output: Option<&str>) {
+fn print_ai_report(report: Option<&str>) {
     if let Some(report) = report {
-        if let Some(path) = ai_output {
-            std::fs::write(path, report).expect("Failed to write AI output");
-            eprintln!("AI report written to {path}");
-        } else {
-            println!("\n---\n\n{report}");
-        }
+        println!("\n---\n\n{report}");
+    }
+}
+
+fn print_ai_preview(report: Option<&str>) {
+    if let Some(report) = report {
+        let preview: String = report.chars().take(500).collect();
+        println!("\nAI Report Preview:\n{preview}\n...");
     }
 }

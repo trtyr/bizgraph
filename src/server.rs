@@ -1,10 +1,6 @@
 use std::sync::Arc;
 
-use axum::{
-    Json, Router,
-    response::Html,
-    routing::get,
-};
+use axum::{response::Html, routing::get, Json, Router};
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
 use crate::{analyze, types::BusinessGraph};

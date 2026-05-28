@@ -159,10 +159,9 @@ impl AgentState {
             .nodes
             .iter()
             .filter_map(|node| match &node.properties {
-                BusinessNodeProperties::BusinessFunction(details) => Some((
-                    node.label.clone(),
-                    details.endpoint_count,
-                )),
+                BusinessNodeProperties::BusinessFunction(details) => {
+                    Some((node.label.clone(), details.endpoint_count))
+                }
                 _ => None,
             })
             .collect();
@@ -176,14 +175,17 @@ impl AgentState {
                 name,
                 priority: (index + 1).min(u8::MAX as usize) as u8,
                 endpoint_count,
-                    analyzed: false,
-                    observations_summary: None,
+                analyzed: false,
+                observations_summary: None,
             })
             .collect();
 
         let progress = Progress {
             completed: Vec::new(),
-            remaining: domain_entries.iter().map(|domain| domain.name.clone()).collect(),
+            remaining: domain_entries
+                .iter()
+                .map(|domain| domain.name.clone())
+                .collect(),
         };
 
         let mut state = Self {
@@ -290,11 +292,7 @@ async fn run_agent(
     let mut calls_made = 0usize;
 
     eprintln!("Phase 1/4: Business overview...");
-    let overview_context = build_turn_context(
-        &state,
-        "OVERVIEW",
-        &build_graph_overview(graph),
-    );
+    let overview_context = build_turn_context(&state, "OVERVIEW", &build_graph_overview(graph));
     let overview = chat_fresh(overview_context, api_key, model, api_url).await?;
     calls_made += 1;
     record_turn(&mut state, "overview", None, &overview);
@@ -336,11 +334,8 @@ async fn run_agent(
     state.phase = "cross".to_string();
     eprintln!("Phase 3/4: Cross-domain correlation...");
     maybe_summarize_context(&mut state, api_key, model, api_url).await?;
-    let cross_context = build_turn_context(
-        &state,
-        "CROSS_DOMAIN",
-        &build_cross_summary(&state, graph),
-    );
+    let cross_context =
+        build_turn_context(&state, "CROSS_DOMAIN", &build_cross_summary(&state, graph));
     let cross = chat_fresh(cross_context, api_key, model, api_url).await?;
     calls_made += 1;
     record_turn(&mut state, "cross", None, &cross);
@@ -430,7 +425,11 @@ async fn maybe_summarize_context(
     model: &str,
     api_url: &str,
 ) -> Result<String, String> {
-    let total_chars: usize = state.turn_responses.iter().map(|response| response.content.len()).sum();
+    let total_chars: usize = state
+        .turn_responses
+        .iter()
+        .map(|response| response.content.len())
+        .sum();
 
     if total_chars < TURN_RESPONSE_SUMMARY_THRESHOLD {
         return Ok(state
@@ -523,7 +522,11 @@ fn update_state_from_overview(
         domain.priority = (index + 1).min(u8::MAX as usize) as u8;
     }
 
-    state.progress.remaining = state.domains.iter().map(|domain| domain.name.clone()).collect();
+    state.progress.remaining = state
+        .domains
+        .iter()
+        .map(|domain| domain.name.clone())
+        .collect();
     let overview_summary = summarize_text(overview_response, FINDING_SUMMARY_CHAR_LIMIT);
     if !overview_summary.is_empty() {
         push_unique(&mut state.cross_cutting, overview_summary);
@@ -592,10 +595,7 @@ fn render_state_snapshot(state: &AgentState) -> String {
             domain.name,
             domain.endpoint_count,
             domain.analyzed,
-            domain
-                .observations_summary
-                .as_deref()
-                .unwrap_or("pending")
+            domain.observations_summary.as_deref().unwrap_or("pending")
         ));
     }
 
@@ -646,10 +646,7 @@ fn render_state_for_final(state: &AgentState) -> String {
             domain.name,
             domain.endpoint_count,
             domain.analyzed,
-            domain
-                .observations_summary
-                .as_deref()
-                .unwrap_or("pending")
+            domain.observations_summary.as_deref().unwrap_or("pending")
         ));
     }
 
@@ -823,7 +820,8 @@ fn extract_notes(block: &str, endpoints: &[String]) -> String {
     }
 
     if endpoints.is_empty() {
-        "Additional business context inferred from the surrounding traffic and workflow structure.".to_string()
+        "Additional business context inferred from the surrounding traffic and workflow structure."
+            .to_string()
     } else {
         format!(
             "Relevant endpoint context grouped from {}.",
@@ -903,7 +901,9 @@ fn push_unique(items: &mut Vec<String>, value: String) {
 fn push_observation(observations: &mut Vec<BusinessObservation>, observation: BusinessObservation) {
     let duplicate = observations.iter().any(|existing| {
         existing.title.eq_ignore_ascii_case(&observation.title)
-            && existing.evidence.eq_ignore_ascii_case(&observation.evidence)
+            && existing
+                .evidence
+                .eq_ignore_ascii_case(&observation.evidence)
     });
 
     if !duplicate {
@@ -1006,25 +1006,53 @@ fn build_graph_summary(graph: &BusinessGraph) -> String {
                     details.confidence
                 ));
 
-                if looks_interesting(&node.label, &details.path_template, &["login", "auth", "token", "session", "oauth", "signin", "signup"]) {
+                if looks_interesting(
+                    &node.label,
+                    &details.path_template,
+                    &[
+                        "login", "auth", "token", "session", "oauth", "signin", "signup",
+                    ],
+                ) {
                     identity_candidates.push(format!(
                         "{} [{}] params={} statuses=[{}]",
                         node.label, methods, parameters, statuses
                     ));
                 }
-                if looks_interesting(&node.label, &details.path_template, &["admin", "internal", "manage", "console", "backoffice", "root"]) {
+                if looks_interesting(
+                    &node.label,
+                    &details.path_template,
+                    &[
+                        "admin",
+                        "internal",
+                        "manage",
+                        "console",
+                        "backoffice",
+                        "root",
+                    ],
+                ) {
                     operator_candidates.push(format!(
                         "{} [{}] statuses=[{}]",
                         node.label, methods, statuses
                     ));
                 }
-                if has_sensitive_parameters(&details.parameters) || looks_interesting(&node.label, &details.path_template, &["password", "secret", "key", "token", "code", "otp", "phone", "email", "user", "account", "invoice", "pay", "order", "refund", "balance"]) {
+                if has_sensitive_parameters(&details.parameters)
+                    || looks_interesting(
+                        &node.label,
+                        &details.path_template,
+                        &[
+                            "password", "secret", "key", "token", "code", "otp", "phone", "email",
+                            "user", "account", "invoice", "pay", "order", "refund", "balance",
+                        ],
+                    )
+                {
                     data_rich_candidates.push(format!(
                         "{} [{}] params={} request_schema={} response_schema={}",
                         node.label, methods, parameters, request_schema, response_schema
                     ));
                 }
-                if details.status_profiles.client_error > 0 || details.status_profiles.server_error > 0 {
+                if details.status_profiles.client_error > 0
+                    || details.status_profiles.server_error > 0
+                {
                     high_error_endpoints.push(format!(
                         "{} success={} redirect={} client_error={} server_error={}",
                         node.label,
@@ -1152,7 +1180,8 @@ fn build_function_detail(function_name: &str, graph: &BusinessGraph) -> String {
         return format!("Business module '{}' not found in graph.", function_name);
     };
 
-    let BusinessNodeProperties::BusinessFunction(function_details) = &function_node.properties else {
+    let BusinessNodeProperties::BusinessFunction(function_details) = &function_node.properties
+    else {
         return format!("Node '{}' is not a business function.", function_name);
     };
 
@@ -1175,7 +1204,10 @@ fn build_function_detail(function_name: &str, graph: &BusinessGraph) -> String {
     if endpoint_ids.is_empty() {
         for node in &graph.nodes {
             if let BusinessNodeProperties::Endpoint(details) = &node.properties {
-                if details.path_template.starts_with(&function_details.path_prefix) {
+                if details
+                    .path_template
+                    .starts_with(&function_details.path_prefix)
+                {
                     endpoint_ids.push(node.id);
                 }
             }
@@ -1211,7 +1243,8 @@ fn build_function_detail(function_name: &str, graph: &BusinessGraph) -> String {
         let parameters = summarize_parameters(&endpoint_details.parameters);
         let request_schema = summarize_schema(&endpoint_details.request_schema);
         let response_schema = summarize_schema(&endpoint_details.response_schema);
-        let call_sequences = build_endpoint_call_sequences(*endpoint_id, &endpoint_by_id, graph, &endpoint_set);
+        let call_sequences =
+            build_endpoint_call_sequences(*endpoint_id, &endpoint_by_id, graph, &endpoint_set);
 
         endpoint_sections.push(format!(
             "### {}\n- path: {}\n- methods: [{}]\n- status_codes: [{}]\n- parameters: {}\n- request_schema: {}\n- response_schema: {}\n- call_sequences (max 10):\n{}\n- normalization_notes: {}\n- confidence: {:.2}",
@@ -1290,7 +1323,10 @@ fn build_cross_domain_summary(graph: &BusinessGraph) -> String {
         domain_links
             .entry((source_function.label.clone(), target_function.label.clone()))
             .or_default()
-            .push(format!("{} -> {} via {}", source_endpoint, target_endpoint, edge.label));
+            .push(format!(
+                "{} -> {} via {}",
+                source_endpoint, target_endpoint, edge.label
+            ));
     }
 
     let mut summary = String::new();
@@ -1365,7 +1401,9 @@ fn summarize_parameters(parameters: &[ParameterDescriptor]) -> String {
 
 fn summarize_schema(schema: &Option<crate::types::SchemaShape>) -> String {
     match schema {
-        Some(shape) => serde_json::to_string(shape).unwrap_or_else(|_| "<schema unavailable>".to_string()),
+        Some(shape) => {
+            serde_json::to_string(shape).unwrap_or_else(|_| "<schema unavailable>".to_string())
+        }
         None => "none".to_string(),
     }
 }
@@ -1381,14 +1419,21 @@ fn summarize_schema_presence(present: bool) -> &'static str {
 fn has_sensitive_parameters(parameters: &[ParameterDescriptor]) -> bool {
     parameters.iter().any(|parameter| {
         let name = parameter.name.to_ascii_lowercase();
-        ["token", "password", "secret", "key", "code", "otp", "auth", "session", "email", "phone", "user", "account", "amount", "price", "balance", "order", "refund", "coupon"]
-            .iter()
-            .any(|needle| name.contains(needle))
+        [
+            "token", "password", "secret", "key", "code", "otp", "auth", "session", "email",
+            "phone", "user", "account", "amount", "price", "balance", "order", "refund", "coupon",
+        ]
+        .iter()
+        .any(|needle| name.contains(needle))
     })
 }
 
 fn looks_interesting(label: &str, path: &str, needles: &[&str]) -> bool {
-    let haystack = format!("{} {}", label.to_ascii_lowercase(), path.to_ascii_lowercase());
+    let haystack = format!(
+        "{} {}",
+        label.to_ascii_lowercase(),
+        path.to_ascii_lowercase()
+    );
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
@@ -1427,12 +1472,15 @@ fn map_endpoint_to_function(graph: &BusinessGraph) -> BTreeMap<uuid::Uuid, uuid:
             continue;
         }
 
-        if let Some(function) = functions.iter().find(|function| match &function.properties {
-            BusinessNodeProperties::BusinessFunction(function_details) => {
-                details.path_template.starts_with(&function_details.path_prefix)
-            }
-            _ => false,
-        }) {
+        if let Some(function) = functions
+            .iter()
+            .find(|function| match &function.properties {
+                BusinessNodeProperties::BusinessFunction(function_details) => details
+                    .path_template
+                    .starts_with(&function_details.path_prefix),
+                _ => false,
+            })
+        {
             mapping.insert(node.id, function.id);
         }
     }
@@ -1442,7 +1490,13 @@ fn map_endpoint_to_function(graph: &BusinessGraph) -> BTreeMap<uuid::Uuid, uuid:
 
 fn build_endpoint_call_sequences(
     endpoint_id: uuid::Uuid,
-    endpoint_by_id: &BTreeMap<uuid::Uuid, (&crate::types::BusinessNode, &crate::types::EndpointProperties)>,
+    endpoint_by_id: &BTreeMap<
+        uuid::Uuid,
+        (
+            &crate::types::BusinessNode,
+            &crate::types::EndpointProperties,
+        ),
+    >,
     graph: &BusinessGraph,
     endpoint_scope: &std::collections::BTreeSet<uuid::Uuid>,
 ) -> Vec<String> {
@@ -1513,7 +1567,11 @@ fn prioritized_function_names(graph: &BusinessGraph, overview_response: &str) ->
     }
 
     prioritized.extend(remaining);
-    prioritized.into_iter().take(5).map(|(label, _)| label).collect()
+    prioritized
+        .into_iter()
+        .take(5)
+        .map(|(label, _)| label)
+        .collect()
 }
 
 async fn chat_fresh(

@@ -17,7 +17,8 @@ pub fn build_business_graph(rows: &[TrafficRow]) -> Result<BusinessGraph, String
     let mut endpoint_state: BTreeMap<String, EndpointAccumulator> = BTreeMap::new();
     let mut business_functions: BTreeMap<String, BusinessFunctionAccumulator> = BTreeMap::new();
     let mut sequence: Vec<String> = Vec::new();
-    let mut response_candidates_by_endpoint: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut response_candidates_by_endpoint: BTreeMap<String, Vec<(String, String)>> =
+        BTreeMap::new();
 
     for row in rows {
         let normalized_path = normalize_path_template(&row.path);
@@ -68,7 +69,10 @@ pub fn build_business_graph(rows: &[TrafficRow]) -> Result<BusinessGraph, String
         let node = BusinessNode {
             id: deterministic_id(stable_key),
             stable_key: stable_key.clone(),
-            label: format!("{} {}{}", endpoint.primary_method, endpoint.host, endpoint.path_template),
+            label: format!(
+                "{} {}{}",
+                endpoint.primary_method, endpoint.host, endpoint.path_template
+            ),
             kind: BusinessNodeKind::Endpoint,
             properties: BusinessNodeProperties::Endpoint(endpoint.to_properties()),
         };
@@ -87,9 +91,9 @@ pub fn build_business_graph(rows: &[TrafficRow]) -> Result<BusinessGraph, String
             if edge_seen.insert(edge_key.clone()) {
                 edges.push(BusinessEdge {
                     id: deterministic_id(&edge_key),
-                    source_node_id: *node_ids
-                        .get(business_key)
-                        .ok_or_else(|| format!("missing business function node for {business_key}"))?,
+                    source_node_id: *node_ids.get(business_key).ok_or_else(|| {
+                        format!("missing business function node for {business_key}")
+                    })?,
                     target_node_id: *node_ids
                         .get(endpoint_key)
                         .ok_or_else(|| format!("missing endpoint node for {endpoint_key}"))?,
@@ -145,12 +149,12 @@ pub fn build_business_graph(rows: &[TrafficRow]) -> Result<BusinessGraph, String
                 if edge_seen.insert(edge_key.clone()) {
                     edges.push(BusinessEdge {
                         id: deterministic_id(&edge_key),
-                        source_node_id: *node_ids
-                            .get(previous_key)
-                            .ok_or_else(|| format!("missing dependency source node for {previous_key}"))?,
-                        target_node_id: *node_ids
-                            .get(current_key)
-                            .ok_or_else(|| format!("missing dependency target node for {current_key}"))?,
+                        source_node_id: *node_ids.get(previous_key).ok_or_else(|| {
+                            format!("missing dependency source node for {previous_key}")
+                        })?,
+                        target_node_id: *node_ids.get(current_key).ok_or_else(|| {
+                            format!("missing dependency target node for {current_key}")
+                        })?,
                         label,
                         properties: json!({ "matched_value_length": value.len() }),
                     });
@@ -274,7 +278,8 @@ impl EndpointAccumulator {
             self.request_samples.push(row.request_body.clone());
         }
         if !row.request_headers.is_empty() && self.request_header_samples.len() < 3 {
-            self.request_header_samples.push(row.request_headers.clone());
+            self.request_header_samples
+                .push(row.request_headers.clone());
         }
         if let Some(query) = &row.query {
             if !query.is_empty() && self.query_samples.len() < 3 {
@@ -402,7 +407,10 @@ fn split_extension(segment: &str) -> Option<(&str, &str)> {
     if stem.is_empty() || extension.is_empty() {
         return None;
     }
-    if !extension.chars().all(|character| character.is_ascii_alphanumeric()) {
+    if !extension
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric())
+    {
         return None;
     }
     Some((stem, extension))
@@ -413,8 +421,14 @@ fn is_all_digits(value: &str) -> bool {
 }
 
 fn is_uuid_like(value: &str) -> bool {
-    let compact: String = value.chars().filter(|character| *character != '-').collect();
-    (32..=36).contains(&compact.len()) && compact.chars().all(|character| character.is_ascii_hexdigit())
+    let compact: String = value
+        .chars()
+        .filter(|character| *character != '-')
+        .collect();
+    (32..=36).contains(&compact.len())
+        && compact
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
 }
 
 fn is_hash_like(value: &str) -> bool {
@@ -427,14 +441,17 @@ fn is_hash_like(value: &str) -> bool {
     }
 
     value.len() >= 16
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-')
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
 }
 
 fn business_path_prefix(normalized_path: &str) -> String {
     let mut segments = Vec::new();
-    for segment in normalized_path.split('/').filter(|segment| !segment.is_empty()) {
+    for segment in normalized_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
         segments.push(segment);
         if !segment.starts_with(':') {
             break;
@@ -454,7 +471,10 @@ fn merge_parameters(
     query: Option<&str>,
     request_body: &str,
 ) {
-    for segment in path_template.split('/').filter(|segment| segment.starts_with(':')) {
+    for segment in path_template
+        .split('/')
+        .filter(|segment| segment.starts_with(':'))
+    {
         let name = segment
             .trim_start_matches(':')
             .split('.')
@@ -464,7 +484,9 @@ fn merge_parameters(
         let kind = path_parameter_kind(segment);
         parameters
             .entry(format!("path:{name}"))
-            .or_insert_with(|| ParameterAccumulator::new(name.clone(), ParameterLocation::Path, kind.clone()))
+            .or_insert_with(|| {
+                ParameterAccumulator::new(name.clone(), ParameterLocation::Path, kind.clone())
+            })
             .observe(kind);
     }
 
@@ -477,7 +499,13 @@ fn merge_parameters(
             let kind = infer_value_kind(value);
             parameters
                 .entry(format!("query:{name}"))
-                .or_insert_with(|| ParameterAccumulator::new(name.to_string(), ParameterLocation::Query, kind.clone()))
+                .or_insert_with(|| {
+                    ParameterAccumulator::new(
+                        name.to_string(),
+                        ParameterLocation::Query,
+                        kind.clone(),
+                    )
+                })
                 .observe(kind);
         }
     }
@@ -488,7 +516,13 @@ fn merge_parameters(
                 let kind = parameter_kind_from_json(value);
                 parameters
                     .entry(format!("body:{name}"))
-                    .or_insert_with(|| ParameterAccumulator::new(name.clone(), ParameterLocation::Body, kind.clone()))
+                    .or_insert_with(|| {
+                        ParameterAccumulator::new(
+                            name.clone(),
+                            ParameterLocation::Body,
+                            kind.clone(),
+                        )
+                    })
                     .observe(kind);
             }
         }
@@ -603,7 +637,9 @@ fn infer_schema_shape(value: &serde_json::Value, depth: usize) -> SchemaShape {
         serde_json::Value::Array(items) => SchemaShape {
             schema_type: SchemaType::Array,
             properties: BTreeMap::new(),
-            items: items.first().map(|item| Box::new(infer_schema_shape(item, depth + 1))),
+            items: items
+                .first()
+                .map(|item| Box::new(infer_schema_shape(item, depth + 1))),
         },
         serde_json::Value::Object(object) => {
             let mut properties = BTreeMap::new();
@@ -621,12 +657,32 @@ fn infer_schema_shape(value: &serde_json::Value, depth: usize) -> SchemaShape {
 
 fn calculate_confidence(endpoint: &EndpointAccumulator) -> f64 {
     let observation_score = (endpoint.observation_count.min(5) as f64) / 5.0;
-    let request_schema_score = if endpoint.request_schema.is_some() { 0.2 } else { 0.0 };
-    let response_schema_score = if endpoint.response_schema.is_some() { 0.2 } else { 0.0 };
-    let parameter_score = if endpoint.parameters.is_empty() { 0.0 } else { 0.1 };
-    let status_score = if endpoint.status_codes.is_empty() { 0.0 } else { 0.1 };
+    let request_schema_score = if endpoint.request_schema.is_some() {
+        0.2
+    } else {
+        0.0
+    };
+    let response_schema_score = if endpoint.response_schema.is_some() {
+        0.2
+    } else {
+        0.0
+    };
+    let parameter_score = if endpoint.parameters.is_empty() {
+        0.0
+    } else {
+        0.1
+    };
+    let status_score = if endpoint.status_codes.is_empty() {
+        0.0
+    } else {
+        0.1
+    };
 
-    (observation_score * 0.4 + request_schema_score + response_schema_score + parameter_score + status_score)
+    (observation_score * 0.4
+        + request_schema_score
+        + response_schema_score
+        + parameter_score
+        + status_score)
         .clamp(0.0, 1.0)
 }
 

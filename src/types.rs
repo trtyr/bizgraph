@@ -193,6 +193,7 @@ pub struct AnalysisRecord {
     pub project_id: Uuid,
     pub excel_path: Option<String>,
     pub host_filter: Option<String>,
+    pub ai_report: Option<String>,
     pub row_count: usize,
     pub new_nodes: usize,
     pub updated_nodes: usize,
