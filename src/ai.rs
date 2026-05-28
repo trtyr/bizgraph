@@ -6,35 +6,52 @@ use crate::types::{
     BusinessEdge, BusinessGraph, BusinessNodeKind, BusinessNodeProperties, ParameterDescriptor,
 };
 
-const SYSTEM_PROMPT: &str = r#"You are a senior penetration tester performing business logic analysis from HTTP traffic structure.
+const SYSTEM_PROMPT: &str = r#"You are a senior business analyst performing application structure analysis from HTTP traffic.
 
 Your job:
 - Infer what business capabilities the target application serves.
 - Reconstruct likely user and operator flows from endpoints and graph edges.
-- Identify business logic and application security concerns, especially exposed admin/internal endpoints, weak or missing auth patterns, sensitive data handling, high-risk workflow transitions, object reference abuse, dangerous state changes, and interesting attack surface.
-- Suggest concrete next steps for deeper manual testing.
+- Map the business domain structure: what functions exist, how they're organized, what data they handle.
+- Identify the purpose of each endpoint and its role in the overall business.
+
+IMPORTANT: You are NOT a security analyst.
+- Do NOT identify vulnerabilities, attack vectors, or security weaknesses.
+- Do NOT use words like "vulnerability", "exploit", "bypass", "injection", "IDOR".
+- Do NOT rate severity or suggest fixes.
 
 Output requirements:
 - Return Markdown only.
-- Use clear sections with headings.
-- Include: Executive Summary, Business Functions, User Flow Hypotheses, Potential Security Concerns, High-Value Endpoints, Recommended Next Tests.
-- Be specific and evidence-based. Reference endpoint paths, methods, parameters, status patterns, and graph relationships.
-- If evidence is weak, say so explicitly instead of overstating certainty."#;
+- Include: Executive Summary, Business Functions, User Flow Analysis, Data Flow Map, Endpoint Purpose Catalog.
+- Be specific and evidence-based. Reference endpoint paths, methods, parameters, status patterns.
+- If evidence is weak, state confidence level."#;
 
-const AGENT_IDENTITY_PROMPT: &str = r#"You are BizGraph Analysis Agent — a penetration tester specializing in traffic-based business logic analysis.
+const AGENT_IDENTITY_PROMPT: &str = r#"You are BizGraph Analysis Agent — a business analyst specializing in understanding application structure from HTTP traffic.
+
+Your ONLY job: analyze traffic patterns to build a deep understanding of the target's business logic.
+
+You are NOT a security analyst. You do NOT identify vulnerabilities, attack vectors, or security weaknesses.
+- Do NOT use words like "vulnerability", "exploit", "attack", "bypass", "injection", "IDOR", "critical", "high risk"
+- Do NOT rate or classify anything by severity
+- Do NOT suggest remediation or fixes
+- Do NOT propose penetration testing steps
+
+You ARE a business analyst. You describe:
+- What the application does for its users
+- How it's organized into functional domains
+- What data flows through which endpoints
+- How users navigate through the system
+
 Your workflow:
-1. OVERVIEW: Scan business functions, identify domains, prioritize
-2. DOMAIN: Per-domain deep dive into endpoints — find auth issues, IDOR, data leaks, injection points
-3. CROSS: Cross-domain correlation — privilege boundaries, data flow between modules
-4. FINAL: Compile comprehensive report
+1. OVERVIEW: Identify business domains from endpoint groupings. What services does this application provide?
+2. DOMAIN: Per-domain deep dive — what does each endpoint DO? What data flows through it? How do users interact with it?
+3. CROSS: Cross-domain correlation — how do business functions connect? What data moves between modules?
+4. FINAL: Compile a comprehensive business understanding report.
 
 Output rules:
 - Be specific: cite endpoint paths, methods, parameters
-- Be evidence-based: link findings to observed traffic patterns
-- Be actionable: each finding must have a concrete test step
-- Rate severity: Critical > High > Medium > Low > Info
-- If evidence is weak, state confidence level
-- Respond in natural Markdown with clear headings and concise, evidence-based analysis."#;
+- Be evidence-based: link observations to traffic patterns
+- Describe WHAT the system does, HOW it's organized, and WHAT data it handles
+- Respond in natural Markdown with clear headings and concise analysis."#;
 const MAX_DEEP_AI_CALLS: usize = 7;
 const AGENT_STATE_TOKEN_LIMIT: usize = 2_500;
 const TURN_DATA_CHAR_LIMIT: usize = 3_200;
@@ -93,7 +110,7 @@ struct ChatMessageContent {
 struct AgentState {
     phase: String,
     domains: Vec<DomainAnalysis>,
-    findings: Vec<Finding>,
+    observations: Vec<BusinessObservation>,
     cross_cutting: Vec<String>,
     progress: Progress,
     token_budget: TokenBudget,
@@ -113,16 +130,15 @@ struct DomainAnalysis {
     priority: u8,
     endpoint_count: usize,
     analyzed: bool,
-    findings_summary: Option<String>,
+    observations_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Finding {
-    severity: Severity,
+struct BusinessObservation {
     title: String,
     evidence: String,
     endpoints: Vec<String>,
-    recommendation: String,
+    notes: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,15 +151,6 @@ struct Progress {
 struct TokenBudget {
     used: usize,
     limit: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-enum Severity {
-    Critical,
-    High,
-    Medium,
-    Low,
-    Info,
 }
 
 impl AgentState {
@@ -169,8 +176,8 @@ impl AgentState {
                 name,
                 priority: (index + 1).min(u8::MAX as usize) as u8,
                 endpoint_count,
-                analyzed: false,
-                findings_summary: None,
+                    analyzed: false,
+                    observations_summary: None,
             })
             .collect();
 
@@ -182,7 +189,7 @@ impl AgentState {
         let mut state = Self {
             phase: "overview".to_string(),
             domains: domain_entries,
-            findings: Vec::new(),
+            observations: Vec::new(),
             cross_cutting: Vec::new(),
             progress,
             token_budget: TokenBudget {
@@ -193,43 +200,6 @@ impl AgentState {
         };
         refresh_token_budget(&mut state);
         state
-    }
-}
-
-impl Severity {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Critical => "Critical",
-            Self::High => "High",
-            Self::Medium => "Medium",
-            Self::Low => "Low",
-            Self::Info => "Info",
-        }
-    }
-
-    fn rank(&self) -> usize {
-        match self {
-            Self::Critical => 0,
-            Self::High => 1,
-            Self::Medium => 2,
-            Self::Low => 3,
-            Self::Info => 4,
-        }
-    }
-
-    fn from_text(text: &str) -> Self {
-        let lowered = text.to_ascii_lowercase();
-        if lowered.contains("critical") {
-            Self::Critical
-        } else if lowered.contains("high") {
-            Self::High
-        } else if lowered.contains("medium") {
-            Self::Medium
-        } else if lowered.contains("low") {
-            Self::Low
-        } else {
-            Self::Info
-        }
     }
 }
 
@@ -254,16 +224,14 @@ pub async fn analyze_with_ai(
                 role: "user".to_string(),
                 content: format!(
                     "Analyze the following structured summary of a business graph extracted from network traffic.\n\
-                     The summary contains BusinessFunction nodes (grouped by host+path prefix), \
-                     Endpoint nodes (HTTP endpoints with methods, status codes, and schemas), \
-                     and edge statistics.\n\
+                     The summary contains BusinessFunction nodes (grouped by host+path prefix) and \
+                     Endpoint nodes (HTTP endpoints with methods, status codes, and schemas).\n\
                      \n\
-                     Identify:\n\
+                     Describe:\n\
                      1. What business functions does this application serve?\n\
                      2. What's the user flow / navigation pattern?\n\
-                     3. Potential security issues (exposed admin endpoints, missing auth, IDOR, sensitive data leak, etc.)\n\
-                     4. High-value targets for manual penetration testing\n\
-                     5. Concrete next steps for deeper testing\n\
+                     3. How are data and operations organized across business functions?\n\
+                     4. What is the purpose of each endpoint?\n\
                      \n\
                      Respond in Markdown.\n\
                      \n{summary}"
@@ -331,7 +299,7 @@ async fn run_agent(
     calls_made += 1;
     record_turn(&mut state, "overview", None, &overview);
     update_state_from_overview(graph, &mut state, &overview);
-    parse_findings_into_state(&mut state, None, &overview);
+    parse_observations_into_state(&mut state, None, &overview);
 
     state.phase = "domain".to_string();
     let domain_budget = MAX_DEEP_AI_CALLS.saturating_sub(3);
@@ -362,7 +330,7 @@ async fn run_agent(
             .map_err(|e| format!("Domain deep-dive task panicked: {e}"))??;
         calls_made += 1;
         record_turn(&mut state, "domain", Some(&domain), &response);
-        parse_findings_into_state(&mut state, Some(&domain), &response);
+        parse_observations_into_state(&mut state, Some(&domain), &response);
     }
 
     state.phase = "cross".to_string();
@@ -432,16 +400,16 @@ fn build_turn_context(state: &AgentState, task: &str, data: &str) -> Vec<ChatMes
 fn build_task_instruction(task: &str) -> &'static str {
     match task {
         "OVERVIEW" => {
-            "Scan the graph overview, identify business domains, prioritize them by testing value, and explain the business context and initial concerns in natural Markdown. Use exact domain names from the data when listing priorities."
+            "Scan the graph overview, identify business domains, categorize by function, and explain the business context."
         }
         "DOMAIN_DEEP_DIVE" => {
-            "Analyze this single business domain in isolation. Focus on authentication gaps, IDOR, sensitive data exposure, workflow abuse, dangerous state changes, and practical manual test ideas. Return natural Markdown with headings, findings, evidence, affected endpoints, and concrete next tests."
+            "Analyze this single business domain. Describe what each endpoint does, what data it handles, what user actions it supports, and how endpoints relate to each other within this domain."
         }
         "CROSS_DOMAIN" => {
-            "Correlate the full domain findings with the topology. Focus on privilege boundaries, data movement, chained workflows, and ways a weakness in one module could affect another. Return natural Markdown with cross-domain findings, evidence, and chained attack hypotheses."
+            "Correlate domain findings with the topology. Describe how business functions connect, what data flows between modules, and the overall business architecture."
         }
         "FINAL_REPORT" => {
-            "Compile the final penetration testing report from the full analysis state. Deduplicate overlapping items, group findings by severity, and keep conclusions tied to observed endpoints and traffic evidence. Return a polished Markdown report suitable for a human reader."
+            "Compile a comprehensive business understanding report. Synthesize all domain analysis into a clear picture of what this application does, organized by business function. Return a polished Markdown report."
         }
         _ => "Analyze the supplied business-graph context and respond in natural Markdown.",
     }
@@ -495,9 +463,9 @@ async fn maybe_summarize_context(
         .join("\n\n---\n\n");
 
     let summary_prompt = format!(
-        "Summarize the following penetration testing analysis history into a concise report.\n\
-         Preserve ALL findings, their severity levels, affected endpoints, evidence, and recommendations.\n\
-         Do NOT omit or truncate any security finding.\n\
+        "Summarize the following business analysis history into a concise report.\n\
+         Preserve ALL business observations, endpoint purposes, data flows, and functional relationships.\n\
+         Do NOT omit or truncate any business finding.\n\
          \n{}",
         full_history
     );
@@ -505,7 +473,7 @@ async fn maybe_summarize_context(
     let request = ChatRequest {
         model: model.to_string(),
         messages: vec![
-            ChatMessage::system("You are a precise technical summarizer. Preserve all security findings, severity levels, endpoints, evidence, and recommendations. Be concise but lose NO information."),
+            ChatMessage::system("You are a precise technical summarizer. Preserve all business analysis findings, endpoint descriptions, data flows, and functional observations. Be concise but lose NO information."),
             ChatMessage::user(summary_prompt),
         ],
         stream: false,
@@ -566,23 +534,23 @@ fn update_state_from_overview(
     refresh_token_budget(state);
 }
 
-fn parse_findings_into_state(state: &mut AgentState, domain: Option<&str>, response: &str) {
+fn parse_observations_into_state(state: &mut AgentState, domain: Option<&str>, response: &str) {
     let _ = check_budget(state, response, state.token_budget.limit);
 
     let summary = summarize_text(response, FINDING_SUMMARY_CHAR_LIMIT);
-    let extracted_findings = parse_findings_from_response(response);
+    let extracted_observations = parse_observations_from_response(response);
 
     if let Some(domain) = domain {
         if let Some(domain_state) = state.domains.iter_mut().find(|item| item.name == domain) {
             domain_state.analyzed = true;
-            domain_state.findings_summary = Some(summary);
+            domain_state.observations_summary = Some(summary);
         }
 
         move_to_completed(&mut state.progress, domain);
     }
 
-    for finding in extracted_findings {
-        push_finding(&mut state.findings, finding);
+    for observation in extracted_observations {
+        push_observation(&mut state.observations, observation);
     }
 
     for item in extract_cross_cutting_items(response) {
@@ -599,8 +567,8 @@ fn compress_cross_into_state(state: &mut AgentState, response: &str) {
         push_unique(&mut state.cross_cutting, item);
     }
 
-    for finding in parse_findings_from_response(response) {
-        push_finding(&mut state.findings, finding);
+    for observation in parse_observations_from_response(response) {
+        push_observation(&mut state.observations, observation);
     }
 
     refresh_token_budget(state);
@@ -608,7 +576,7 @@ fn compress_cross_into_state(state: &mut AgentState, response: &str) {
 
 fn build_cross_summary(state: &AgentState, graph: &BusinessGraph) -> String {
     format!(
-        "Structured findings state:\n{}\n\nObserved cross-domain topology:\n{}",
+        "Structured business observations state:\n{}\n\nObserved cross-domain topology:\n{}",
         render_state_snapshot(state),
         build_cross_domain_summary(graph)
     )
@@ -625,24 +593,23 @@ fn render_state_snapshot(state: &AgentState) -> String {
             domain.endpoint_count,
             domain.analyzed,
             domain
-                .findings_summary
+                .observations_summary
                 .as_deref()
                 .unwrap_or("pending")
         ));
     }
 
-    out.push_str("\nFindings:\n");
-    if state.findings.is_empty() {
+    out.push_str("\nBusiness observations:\n");
+    if state.observations.is_empty() {
         out.push_str("- none\n");
     } else {
-        for finding in &state.findings {
+        for observation in &state.observations {
             out.push_str(&format!(
-                "- [{}] {} | endpoints={} | evidence={} | recommendation={}\n",
-                finding.severity.as_str(),
-                finding.title,
-                join_or_none(&finding.endpoints),
-                finding.evidence,
-                finding.recommendation
+                "- {} | endpoints={} | evidence={} | notes={}\n",
+                observation.title,
+                join_or_none(&observation.endpoints),
+                observation.evidence,
+                observation.notes
             ));
         }
     }
@@ -680,24 +647,23 @@ fn render_state_for_final(state: &AgentState) -> String {
             domain.endpoint_count,
             domain.analyzed,
             domain
-                .findings_summary
+                .observations_summary
                 .as_deref()
                 .unwrap_or("pending")
         ));
     }
 
-    out.push_str("\nStructured findings:\n");
-    if state.findings.is_empty() {
+    out.push_str("\nStructured business observations:\n");
+    if state.observations.is_empty() {
         out.push_str("- none\n");
     } else {
-        for finding in &state.findings {
+        for observation in &state.observations {
             out.push_str(&format!(
-                "- severity={} | title={} | endpoints={} | evidence={} | recommendation={}\n",
-                finding.severity.as_str(),
-                finding.title,
-                join_or_none(&finding.endpoints),
-                finding.evidence,
-                finding.recommendation
+                "- title={} | endpoints={} | evidence={} | notes={}\n",
+                observation.title,
+                join_or_none(&observation.endpoints),
+                observation.evidence,
+                observation.notes
             ));
         }
     }
@@ -738,17 +704,18 @@ fn extract_key_bullets(text: &str, limit: usize) -> Vec<String> {
                     || line.starts_with("1. ")
                     || line.starts_with("2. ")
                     || line.starts_with("3. ")
-                    || line.contains("critical")
-                    || line.contains("high")
-                    || line.contains("idor")
-                    || line.contains("auth")
-                    || line.contains("privilege"))
+                    || line.to_ascii_lowercase().contains("business")
+                    || line.to_ascii_lowercase().contains("domain")
+                    || line.to_ascii_lowercase().contains("flow")
+                    || line.to_ascii_lowercase().contains("endpoint")
+                    || line.to_ascii_lowercase().contains("data")
+                    || line.to_ascii_lowercase().contains("user"))
         })
         .take(limit)
         .collect()
 }
 
-fn parse_findings_from_response(response: &str) -> Vec<Finding> {
+fn parse_observations_from_response(response: &str) -> Vec<BusinessObservation> {
     let mut blocks = Vec::new();
     let mut current = String::new();
 
@@ -757,7 +724,7 @@ fn parse_findings_from_response(response: &str) -> Vec<Finding> {
         let starts_new_block = line.starts_with("##")
             || line.starts_with("###")
             || line.starts_with("####")
-            || (line.starts_with("- ") && contains_security_signal(line));
+            || line.starts_with("- ");
 
         if starts_new_block && !current.trim().is_empty() {
             blocks.push(current.trim().to_string());
@@ -776,28 +743,22 @@ fn parse_findings_from_response(response: &str) -> Vec<Finding> {
         blocks.push(current.trim().to_string());
     }
 
-    let mut findings = Vec::new();
+    let mut observations = Vec::new();
     for block in blocks {
-        if !contains_security_signal(&block) {
-            continue;
-        }
-
         let title = extract_title(&block);
-        let severity = Severity::from_text(&block);
         let evidence = block.clone();
         let endpoints = extract_endpoints(&block);
-        let recommendation = extract_recommendation(&block, &endpoints);
+        let notes = extract_notes(&block, &endpoints);
 
-        findings.push(Finding {
-            severity,
+        observations.push(BusinessObservation {
             title,
             evidence,
             endpoints,
-            recommendation,
+            notes,
         });
     }
 
-    findings
+    observations
 }
 
 fn extract_cross_cutting_items(response: &str) -> Vec<String> {
@@ -810,12 +771,14 @@ fn extract_cross_cutting_items(response: &str) -> Vec<String> {
 
         let lowered = cleaned.to_ascii_lowercase();
         if lowered.contains("cross")
-            || lowered.contains("privilege")
             || lowered.contains("shared")
-            || lowered.contains("session")
-            || lowered.contains("token")
             || lowered.contains("workflow")
             || lowered.contains("data flow")
+            || lowered.contains("user flow")
+            || lowered.contains("module")
+            || lowered.contains("domain")
+            || lowered.contains("business")
+            || lowered.contains("relationship")
         {
             items.push(cleaned);
         }
@@ -824,75 +787,46 @@ fn extract_cross_cutting_items(response: &str) -> Vec<String> {
     items
 }
 
-fn contains_security_signal(text: &str) -> bool {
-    let lowered = text.to_ascii_lowercase();
-    [
-        "critical",
-        "high",
-        "medium",
-        "low",
-        "idor",
-        "auth",
-        "authorization",
-        "privilege",
-        "leak",
-        "exposure",
-        "inject",
-        "bypass",
-        "csrf",
-        "ssrf",
-        "refund",
-        "payment",
-        "state change",
-        "workflow",
-    ]
-    .iter()
-    .any(|needle| lowered.contains(needle))
-}
-
 fn extract_title(block: &str) -> String {
-    let first_line = block.lines().next().unwrap_or("Finding");
+    let first_line = block.lines().next().unwrap_or("Observation");
     let cleaned = clean_line(first_line)
         .trim_start_matches('#')
         .trim_start_matches('-')
         .trim()
         .to_string();
 
-    let without_severity = ["Critical", "High", "Medium", "Low", "Info"]
-        .iter()
-        .fold(cleaned, |title, severity| title.replace(severity, ""));
-
-    let normalized = without_severity
+    let normalized = cleaned
         .trim_start_matches(':')
         .trim_start_matches('-')
         .trim();
 
     if normalized.is_empty() {
-        "Finding".to_string()
+        "Observation".to_string()
     } else {
         normalized.to_string()
     }
 }
 
-fn extract_recommendation(block: &str, endpoints: &[String]) -> String {
+fn extract_notes(block: &str, endpoints: &[String]) -> String {
     for line in block.lines() {
         let cleaned = clean_line(line);
         let lowered = cleaned.to_ascii_lowercase();
-        if lowered.contains("test")
-            || lowered.contains("verify")
-            || lowered.contains("attempt")
-            || lowered.contains("check")
-            || lowered.contains("replay")
+        if lowered.contains("data")
+            || lowered.contains("flow")
+            || lowered.contains("user")
+            || lowered.contains("domain")
+            || lowered.contains("module")
+            || lowered.contains("business")
         {
             return cleaned;
         }
     }
 
     if endpoints.is_empty() {
-        "Manually validate authorization, object ownership, and state transitions using the highlighted business workflow.".to_string()
+        "Additional business context inferred from the surrounding traffic and workflow structure.".to_string()
     } else {
         format!(
-            "Manually verify authorization and workflow integrity on {}.",
+            "Relevant endpoint context grouped from {}.",
             join_or_none(endpoints)
         )
     }
@@ -966,20 +900,15 @@ fn push_unique(items: &mut Vec<String>, value: String) {
     }
 }
 
-fn push_finding(findings: &mut Vec<Finding>, finding: Finding) {
-    let duplicate = findings.iter().any(|existing| {
-        existing.title.eq_ignore_ascii_case(&finding.title)
-            && existing.evidence.eq_ignore_ascii_case(&finding.evidence)
+fn push_observation(observations: &mut Vec<BusinessObservation>, observation: BusinessObservation) {
+    let duplicate = observations.iter().any(|existing| {
+        existing.title.eq_ignore_ascii_case(&observation.title)
+            && existing.evidence.eq_ignore_ascii_case(&observation.evidence)
     });
 
     if !duplicate {
-        findings.push(finding);
-        findings.sort_by(|left, right| {
-            left.severity
-                .rank()
-                .cmp(&right.severity.rank())
-                .then_with(|| left.title.cmp(&right.title))
-        });
+        observations.push(observation);
+        observations.sort_by(|left, right| left.title.cmp(&right.title));
     }
 }
 
@@ -1038,9 +967,9 @@ fn build_graph_summary(graph: &BusinessGraph) -> String {
     let mut edge_counts: BTreeMap<&str, usize> = BTreeMap::new();
     let mut data_dependencies = Vec::new();
     let mut call_sequences = Vec::new();
-    let mut auth_candidates = Vec::new();
-    let mut admin_candidates = Vec::new();
-    let mut sensitive_candidates = Vec::new();
+    let mut identity_candidates = Vec::new();
+    let mut operator_candidates = Vec::new();
+    let mut data_rich_candidates = Vec::new();
     let mut high_error_endpoints = Vec::new();
 
     for node in &graph.nodes {
@@ -1078,19 +1007,19 @@ fn build_graph_summary(graph: &BusinessGraph) -> String {
                 ));
 
                 if looks_interesting(&node.label, &details.path_template, &["login", "auth", "token", "session", "oauth", "signin", "signup"]) {
-                    auth_candidates.push(format!(
+                    identity_candidates.push(format!(
                         "{} [{}] params={} statuses=[{}]",
                         node.label, methods, parameters, statuses
                     ));
                 }
                 if looks_interesting(&node.label, &details.path_template, &["admin", "internal", "manage", "console", "backoffice", "root"]) {
-                    admin_candidates.push(format!(
+                    operator_candidates.push(format!(
                         "{} [{}] statuses=[{}]",
                         node.label, methods, statuses
                     ));
                 }
                 if has_sensitive_parameters(&details.parameters) || looks_interesting(&node.label, &details.path_template, &["password", "secret", "key", "token", "code", "otp", "phone", "email", "user", "account", "invoice", "pay", "order", "refund", "balance"]) {
-                    sensitive_candidates.push(format!(
+                    data_rich_candidates.push(format!(
                         "{} [{}] params={} request_schema={} response_schema={}",
                         node.label, methods, parameters, request_schema, response_schema
                     ));
@@ -1157,14 +1086,14 @@ fn build_graph_summary(graph: &BusinessGraph) -> String {
     summary.push_str("\nObserved data dependencies (up to 25):\n");
     append_limited(&mut summary, &data_dependencies, 25);
 
-    summary.push_str("\nAuthentication-related candidates:\n");
-    append_limited(&mut summary, &auth_candidates, 20);
+    summary.push_str("\nIdentity and session-related endpoints:\n");
+    append_limited(&mut summary, &identity_candidates, 20);
 
-    summary.push_str("\nAdmin/internal candidates:\n");
-    append_limited(&mut summary, &admin_candidates, 20);
+    summary.push_str("\nOperator or management-oriented endpoints:\n");
+    append_limited(&mut summary, &operator_candidates, 20);
 
-    summary.push_str("\nSensitive or high-value endpoint candidates:\n");
-    append_limited(&mut summary, &sensitive_candidates, 25);
+    summary.push_str("\nData-rich business endpoints:\n");
+    append_limited(&mut summary, &data_rich_candidates, 25);
 
     summary.push_str("\nEndpoints with notable error activity:\n");
     append_limited(&mut summary, &high_error_endpoints, 20);
