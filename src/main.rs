@@ -259,7 +259,7 @@ async fn main() {
 
             let outcome = match action {
                 ProjectAction::New { name } => db.create_project(&name).map(|project| {
-                    println!("Created project '{}' ({})", project.name, project.id);
+                    println!("Created project '{}' ({})", project.name, short_id(&project.id));
                 }),
                 ProjectAction::List => db.list_projects().map(|projects| {
                     if projects.is_empty() {
@@ -267,8 +267,9 @@ async fn main() {
                         return;
                     }
 
+                    println!("{:<10} {:<26} {}", "ID", "CREATED", "NAME");
                     for project in projects {
-                        println!("{}\t{}\t{}", project.id, project.created_at.to_rfc3339(), project.name);
+                        println!("{:<10} {:<26} {}", short_id(&project.id), project.created_at.to_rfc3339(), project.name);
                     }
                 }),
                 ProjectAction::Show { name } => resolve_project(&db, &name).and_then(|project| {
@@ -276,7 +277,7 @@ async fn main() {
                     let history = db.get_analysis_history(project.id)?;
                     let counts = node_counts(&graph);
                     println!("Project: {}", project.name);
-                    println!("ID: {}", project.id);
+                    println!("ID: {}", short_id(&project.id));
                     println!("Created: {}", project.created_at.to_rfc3339());
                     println!("Nodes: {} total", graph.nodes.len());
                     for (kind, count) in counts {
@@ -375,6 +376,10 @@ fn print_graph_summary(graph: &bizgraph::types::BusinessGraph) {
         println!("  {kind}: {count}");
     }
     println!("Edges: {} total", graph.edges.len());
+}
+
+fn short_id(id: &uuid::Uuid) -> String {
+    id.to_string().chars().take(8).collect()
 }
 
 fn node_counts(graph: &bizgraph::types::BusinessGraph) -> BTreeMap<&'static str, usize> {
