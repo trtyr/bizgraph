@@ -153,12 +153,9 @@ impl fmt::Display for Error {
             Self::EmptyProjectReference => write!(f, "project name or id cannot be empty"),
             Self::ApiRequest { context, source } => write!(f, "{context}: {source}"),
             Self::ApiResponse { status, body, url } => {
-                let truncated = if body.len() > 200 {
-                    format!("{}...", &body[..200])
-                } else {
-                    body.clone()
-                };
-                write!(f, "AI API error ({status}) at {url}: {truncated}")
+                let truncated: String = body.chars().take(200).collect();
+                let suffix = if truncated.len() < body.len() { "..." } else { "" };
+                write!(f, "AI API error ({status}) at {url}: {truncated}{suffix}")
             }
             Self::ApiResponseDecode { context, source } => write!(f, "{context}: {source}"),
             Self::BudgetExceeded { scope, used, limit } => {
