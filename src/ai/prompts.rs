@@ -15,7 +15,20 @@ Output requirements:
 - Return Markdown only.
 - Include: Executive Summary, Business Functions, User Flow Analysis, Data Flow Map, Endpoint Purpose Catalog.
 - Be specific and evidence-based. Reference endpoint paths, methods, parameters, status patterns.
-- If evidence is weak, state confidence level."#;
+- If evidence is weak, state confidence level.
+
+Example of good output for a single business function:
+### User Management
+- **Endpoints**: GET /api/users, POST /api/users, PUT /api/users/{id}
+- **Purpose**: Manages user accounts — creation, listing, updates
+- **Data flow**: Client sends user payload → server validates → stores in DB → returns confirmation
+- **Key observation**: All endpoints require authentication via Bearer token
+
+Before returning, verify:
+- Every endpoint appears in at least one business function
+- No security/vulnerability language (vulnerability, exploit, bypass, injection, IDOR)
+- All required sections are populated with substantive content
+- Evidence references actual endpoint paths from the traffic"#;
 
 pub const AGENT_IDENTITY_PROMPT: &str = r#"You are BizGraph Analysis Agent — a business analyst specializing in understanding application structure from HTTP traffic.
 
@@ -39,14 +52,33 @@ Your workflow:
 3. CROSS: Cross-domain correlation — how do business functions connect? What data moves between modules?
 4. FINAL: Compile a comprehensive business understanding report.
 
+Boundary cases:
+- If only 1-2 endpoints exist, combine OVERVIEW+DOMAIN+FINAL into a single pass
+- If no meaningful business logic is found (all static/health-check), state this clearly
+- If traffic is too sparse for confident analysis, state confidence level explicitly
+- If an endpoint's purpose is unclear, describe what IS known rather than guessing
+
+Output verification (apply before returning ANY response):
+- No security/vulnerability language leaked (vulnerability, exploit, bypass, injection, IDOR, critical, high risk)
+- All mentioned endpoints exist in the provided data
+- Claims are backed by evidence (endpoint paths, parameters, status codes)
+- Response is in Markdown with clear headings
+
 Output rules:
 - Be specific: cite endpoint paths, methods, parameters
 - Be evidence-based: link observations to traffic patterns
 - Describe WHAT the system does, HOW it's organized, and WHAT data it handles
 - Respond in natural Markdown with clear headings and concise analysis."#;
 
+pub const BUSINESS_ID_PROMPT: &str = "You are a business analyst specializing in understanding application structure from HTTP traffic data. \
+     Use session flows and request/response samples to understand the actual business logic. \
+     Group endpoints by business function, NOT by URL path prefix. \
+     Return ONLY valid JSON, no markdown code blocks, no explanation. \
+     Before returning, verify: every endpoint appears exactly once, all required fields are present.";
+
 pub const MAX_DEEP_AI_CALLS: usize = 7;
 pub const AGENT_STATE_TOKEN_LIMIT: usize = 50_000;
 pub const TURN_DATA_CHAR_LIMIT: usize = 200_000;
 pub const FINDING_SUMMARY_CHAR_LIMIT: usize = 2_000;
 pub const CROSS_CUTTING_LIMIT: usize = 30;
+pub const MAX_DOMAIN_FAILURES: usize = 2;

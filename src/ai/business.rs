@@ -279,11 +279,7 @@ IMPORTANT:
     );
 
     let messages = vec![
-        chat::ChatMessage::system(
-            "You are a business analyst. Identify business functions from HTTP traffic data. \
-             Use session flows and request/response samples to understand the actual business logic. \
-             Return ONLY valid JSON, no markdown code blocks, no explanation.",
-        ),
+        chat::ChatMessage::system(super::prompts::BUSINESS_ID_PROMPT),
         chat::ChatMessage::user(prompt),
     ];
 

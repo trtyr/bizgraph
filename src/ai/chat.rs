@@ -72,7 +72,7 @@ pub async fn send_chat_request(
     for attempt in 0..=max_retries {
         if attempt > 0 {
             let delay_ms = 1000 * (1u64 << (attempt - 1)); // 1s, 2s, 4s
-            eprintln!("  ⏳ 重试 {attempt}/{max_retries} (等待 {}ms)...", delay_ms);
+            eprintln!("  ⏳ Retry {attempt}/{max_retries} (waiting {}ms)...", delay_ms);
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
         }
 
@@ -117,7 +117,7 @@ pub async fn send_chat_request(
         let body = resp.text().await.unwrap_or_default();
 
         if should_retry && attempt < max_retries {
-            eprintln!("  ⚠ API 返回 {status}，将重试...");
+            eprintln!("  ⚠ API returned {status}, retrying...");
             last_err = Some(Error::ApiResponse { status, body, url: api_url.to_string() });
             continue;
         }

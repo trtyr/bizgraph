@@ -134,7 +134,7 @@ pub async fn run_agent(
     calls_made += 1;
     record_turn(&mut state, "overview", None, &overview);
     update_state_from_overview(graph, &mut state, &overview);
-    parse_observations_into_state(&mut state, None, &overview);
+    parse_observations_into_state(&mut state, None, &overview)?;
 
     state.phase = "domain".to_string();
     let domain_budget = MAX_DEEP_AI_CALLS.saturating_sub(3);
@@ -159,22 +159,39 @@ pub async fn run_agent(
         }));
     }
 
+    let mut domain_failures = 0usize;
     for (i, task) in domain_tasks.into_iter().enumerate() {
-        let (domain, response) = task
-            .await
-            .map_err(|error| Error::TaskPanicked {
-                task: "Domain deep-dive task".to_string(),
-                details: error.to_string(),
-            })??;
-        calls_made += 1;
-        record_turn(&mut state, "domain", Some(&domain), &response);
-        parse_observations_into_state(&mut state, Some(&domain), &response);
-        eprintln!(
-            "  ✓ [{}/{}] {} 完成",
-            i + 1,
-            selected_domains.len(),
-            domain
-        );
+        match task.await {
+            Ok(Ok((domain, response))) => {
+                calls_made += 1;
+                record_turn(&mut state, "domain", Some(&domain), &response);
+                if let Err(error) = parse_observations_into_state(&mut state, Some(&domain), &response) {
+                    eprintln!("  Warning: failed to parse observations for {domain}: {error}");
+                }
+                eprintln!(
+                    "  Done [{}/{}] {}",
+                    i + 1,
+                    selected_domains.len(),
+                    domain
+                );
+            }
+            Ok(Err(error)) => {
+                domain_failures += 1;
+                eprintln!("  Failed [{}/{}]: {error}", i + 1, selected_domains.len());
+                if domain_failures >= MAX_DOMAIN_FAILURES {
+                    eprintln!("  Too many domain failures ({domain_failures}), stopping domain analysis.");
+                    break;
+                }
+            }
+            Err(error) => {
+                domain_failures += 1;
+                eprintln!("  Panicked [{}/{}]: {error}", i + 1, selected_domains.len());
+                if domain_failures >= MAX_DOMAIN_FAILURES {
+                    eprintln!("  Too many domain failures ({domain_failures}), stopping domain analysis.");
+                    break;
+                }
+            }
+        }
     }
 
     state.phase = "cross_final".to_string();
@@ -220,11 +237,15 @@ fn build_turn_context(state: &AgentState, task: &str, data: &str) -> Vec<ChatMes
         format!("Previous analysis results:\n\n{}\n\n---\n\n", accumulated)
     };
     let char_count = data.chars().count();
-    if char_count > TURN_DATA_CHAR_LIMIT {
+    let data = if char_count > TURN_DATA_CHAR_LIMIT {
         eprintln!(
-            "Soft warning: task {task} context payload is {char_count} chars, above soft limit {TURN_DATA_CHAR_LIMIT}; keeping full data."
+            "Warning: task {task} context payload is {char_count} chars, above limit {TURN_DATA_CHAR_LIMIT}; truncating."
         );
-    }
+        let truncated: String = data.chars().take(TURN_DATA_CHAR_LIMIT).collect();
+        format!("{truncated}\n\n[truncated — {char_count} chars total, showing first {TURN_DATA_CHAR_LIMIT}]")
+    } else {
+        data.to_string()
+    };
 
     vec![
         ChatMessage::system(AGENT_IDENTITY_PROMPT),
@@ -238,19 +259,50 @@ fn build_turn_context(state: &AgentState, task: &str, data: &str) -> Vec<ChatMes
 fn build_task_instruction(task: &str) -> &'static str {
     match task {
         "OVERVIEW" => {
-            "Scan the graph overview, identify business domains, categorize by function, and explain the business context."
+            "Analyze the graph overview to identify business domains.\n\n\
+             Required output:\n\
+             1. List each business domain with its purpose (1-2 sentences)\n\
+             2. Rank domains by business importance (not just endpoint count)\n\
+             3. Identify cross-cutting concerns (auth, logging, shared services)\n\
+             4. Note any patterns in the endpoint structure\n\n\
+             Return Markdown with clear ## headings per domain."
         }
         "DOMAIN_DEEP_DIVE" => {
-            "Analyze this single business domain. Describe what each endpoint does, what data it handles, what user actions it supports, and how endpoints relate to each other within this domain."
-        }
-        "CROSS_DOMAIN" => {
-            "Correlate domain findings with the topology. Describe how business functions connect, what data flows between modules, and the overall business architecture."
+            "Deep-dive into a single business domain.\n\n\
+             Required output:\n\
+             1. Domain purpose — what business function does it serve?\n\
+             2. Endpoint catalog — for each endpoint:\n\
+                - What it does (action + data)\n\
+                - Input parameters and their meaning\n\
+                - Response structure and key fields\n\
+                - Role in the user workflow\n\
+             3. Data flow — what data enters, transforms, and exits this domain\n\
+             4. Internal relationships — how endpoints within this domain connect\n\n\
+             Cite specific endpoint paths, methods, and parameters as evidence."
         }
         "CROSS_FINAL" => {
-            "First, correlate domain findings with the topology — describe how business functions connect, what data flows between modules, and the overall business architecture. Then, compile a comprehensive business understanding report synthesizing all domain analysis into a clear picture of what this application does, organized by business function. Return a polished Markdown report."
+            "Two-part task:\n\n\
+             Part 1 — Cross-domain correlation:\n\
+             - How do business functions connect? What data flows between modules?\n\
+             - What are the key user journeys that span multiple domains?\n\
+             - Are there shared data entities across domains?\n\n\
+             Part 2 — Final report:\n\
+             - Executive summary (3-5 sentences)\n\
+             - Business functions overview (grouped by domain)\n\
+             - User flow analysis (key journeys)\n\
+             - Data flow map (how data moves through the system)\n\
+             - Endpoint purpose catalog (each endpoint's role)\n\n\
+             Return a polished Markdown report with all sections populated."
         }
         "FINAL_REPORT" => {
-            "Compile a comprehensive business understanding report. Synthesize all domain analysis into a clear picture of what this application does, organized by business function. Return a polished Markdown report."
+            "Compile a comprehensive business understanding report.\n\n\
+             Required sections:\n\
+             1. Executive Summary — what does this application do?\n\
+             2. Business Functions — grouped by domain, with endpoint details\n\
+             3. User Flow Analysis — key user journeys through the system\n\
+             4. Data Flow Map — how data moves between modules\n\
+             5. Endpoint Purpose Catalog — each endpoint's role and data\n\n\
+             Return polished Markdown."
         }
         _ => "Analyze the supplied business-graph context and respond in natural Markdown.",
     }
@@ -314,7 +366,12 @@ async fn force_summarize_context(
     let request = ChatRequest {
         model: model.to_string(),
         messages: vec![
-            ChatMessage::system("You are a precise technical summarizer. Preserve all business analysis findings, endpoint descriptions, data flows, and functional observations. Be concise but lose NO information."),
+            ChatMessage::system(format!(
+                "{AGENT_IDENTITY_PROMPT}\n\n\
+                 You are now in SUMMARIZATION mode. Your task: condense the provided analysis history \
+                 into a concise but complete summary. Preserve ALL business observations, endpoint purposes, \
+                 data flows, and functional relationships. Be concise but lose NO information."
+            )),
             ChatMessage::user(summary_prompt),
         ],
         stream: false,
@@ -389,8 +446,8 @@ fn update_state_from_overview(
     refresh_token_budget(state);
 }
 
-fn parse_observations_into_state(state: &mut AgentState, domain: Option<&str>, response: &str) {
-    let _ = check_budget(state, response, state.token_budget.limit);
+fn parse_observations_into_state(state: &mut AgentState, domain: Option<&str>, response: &str) -> Result<()> {
+    check_budget(state, response, state.token_budget.limit)?;
 
     let summary = summarize_text(response, FINDING_SUMMARY_CHAR_LIMIT);
     let extracted_observations = parse_observations_from_response(response);
@@ -413,6 +470,7 @@ fn parse_observations_into_state(state: &mut AgentState, domain: Option<&str>, r
     }
 
     refresh_token_budget(state);
+    Ok(())
 }
 
 fn build_cross_summary(state: &AgentState, graph: &BusinessGraph) -> String {
@@ -528,7 +586,18 @@ fn parse_prioritized_domains_from_overview(
 }
 
 fn extract_final_report(response: &str) -> String {
-    response.to_string()
+    // Strip any preamble before the first Markdown heading
+    let trimmed = response.trim();
+    if let Some(start) = trimmed.find('\n') {
+        let first_line = &trimmed[..start];
+        // If first line looks like a preamble (no heading), skip to first heading
+        if !first_line.starts_with('#') {
+            if let Some(heading_pos) = trimmed.find("\n#") {
+                return trimmed[heading_pos + 1..].to_string();
+            }
+        }
+    }
+    trimmed.to_string()
 }
 
 fn join_or_none(items: &[String]) -> String {
@@ -567,7 +636,8 @@ fn push_observation(observations: &mut Vec<BusinessObservation>, observation: Bu
 }
 
 fn estimate_tokens(text: &str) -> usize {
-    text.len() / 4
+    // Use char count / 3 for better CJK accuracy (1 CJK char ≈ 2-3 tokens)
+    text.chars().count() * 4 / 3
 }
 
 fn check_budget(state: &AgentState, new_text: &str, limit: usize) -> Result<()> {
