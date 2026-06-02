@@ -77,8 +77,13 @@ pub const BUSINESS_ID_PROMPT: &str = "You are a business analyst specializing in
      Before returning, verify: every endpoint appears exactly once, all required fields are present.";
 
 pub const MAX_DEEP_AI_CALLS: usize = 7;
-pub const AGENT_STATE_TOKEN_LIMIT: usize = 50_000;
+pub const AGENT_STATE_TOKEN_LIMIT: usize = 100_000;
 pub const TURN_DATA_CHAR_LIMIT: usize = 200_000;
 pub const FINDING_SUMMARY_CHAR_LIMIT: usize = 2_000;
 pub const CROSS_CUTTING_LIMIT: usize = 30;
 pub const MAX_DOMAIN_FAILURES: usize = 2;
+
+// Context management for large HAR files
+pub const MAX_ENDPOINTS_PER_DOMAIN: usize = 20;
+pub const SAMPLE_BODY_CHAR_LIMIT: usize = 2_000;
+pub const SUMMARY_HARD_CHAR_LIMIT: usize = 80_000;

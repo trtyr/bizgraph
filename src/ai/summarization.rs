@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use super::prompts::{MAX_ENDPOINTS_PER_DOMAIN, SUMMARY_HARD_CHAR_LIMIT};
 use crate::types::{
     BusinessEdge, BusinessGraph, BusinessNode, BusinessNodeKind, BusinessNodeProperties,
     EndpointProperties, ParameterDescriptor,
@@ -148,9 +149,16 @@ pub fn build_graph_summary(graph: &BusinessGraph) -> String {
     }
 
     summary.push_str("\nBusiness functions and endpoints:\n");
-    for line in lines {
-        summary.push_str(&line);
+    for line in &lines {
+        summary.push_str(line);
         summary.push('\n');
+        if summary.len() > SUMMARY_HARD_CHAR_LIMIT {
+            summary.push_str(&format!(
+                "\n[truncated — {} total lines, showing first portion to stay within context limit]\n",
+                lines.len()
+            ));
+            break;
+        }
     }
 
     summary.push_str("\nObserved call sequences (up to 25):\n");
@@ -262,6 +270,25 @@ pub fn build_function_detail(function_name: &str, graph: &BusinessGraph) -> Stri
     endpoint_ids.sort();
     endpoint_ids.dedup();
 
+    // Prioritize endpoints by richness: parameters, schemas, error activity
+    endpoint_ids.sort_by(|a, b| {
+        let score = |id: &uuid::Uuid| -> usize {
+            endpoint_by_id.get(id).map(|(_, d)| {
+                let mut s = d.parameters.len() * 2;
+                if d.request_schema.is_some() { s += 3; }
+                if d.response_schema.is_some() { s += 3; }
+                s += d.status_profiles.success.min(10);
+                s += d.status_profiles.client_error.min(5) * 2;
+                s
+            }).unwrap_or(0)
+        };
+        score(b).cmp(&score(a))
+    });
+
+    let total_endpoints = endpoint_ids.len();
+    let truncated = total_endpoints > MAX_ENDPOINTS_PER_DOMAIN;
+    endpoint_ids.truncate(MAX_ENDPOINTS_PER_DOMAIN);
+
     let endpoint_set: std::collections::BTreeSet<_> = endpoint_ids.iter().copied().collect();
     let mut lines = Vec::new();
     lines.push(format!(
@@ -312,6 +339,12 @@ pub fn build_function_detail(function_name: &str, graph: &BusinessGraph) -> Stri
 
     lines.push("\nEndpoints:\n".to_string());
     lines.extend(endpoint_sections);
+    if truncated {
+        lines.push(format!(
+            "\n[Showing top {} of {} endpoints — prioritized by parameter richness and schema coverage]",
+            MAX_ENDPOINTS_PER_DOMAIN, total_endpoints
+        ));
+    }
     lines.join("\n")
 }
 

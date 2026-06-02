@@ -8,6 +8,7 @@ use crate::parser::TrafficRow;
 use crate::{Error, Result};
 
 use super::chat;
+use super::prompts::SAMPLE_BODY_CHAR_LIMIT;
 
 /// A business function identified by the AI, with its associated endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,15 +190,28 @@ pub fn build_sample_summary(samples: &[EndpointSample]) -> String {
             sample.status.map_or("-".to_string(), |s| s.to_string()),
         ));
         if !sample.request_body.is_empty() {
-            out.push_str(&format!("Request: {}\n", sample.request_body));
+            let body = truncate_body(&sample.request_body, SAMPLE_BODY_CHAR_LIMIT);
+            out.push_str(&format!("Request: {}\n", body));
         }
         if !sample.response_body.is_empty() {
-            out.push_str(&format!("Response: {}\n", sample.response_body));
+            let body = truncate_body(&sample.response_body, SAMPLE_BODY_CHAR_LIMIT);
+            out.push_str(&format!("Response: {}\n", body));
         }
         out.push('\n');
     }
 
     out
+}
+
+/// Truncate a body string to a char limit, adding a note if truncated.
+fn truncate_body(body: &str, limit: usize) -> String {
+    let char_count = body.chars().count();
+    if char_count <= limit {
+        body.to_string()
+    } else {
+        let truncated: String = body.chars().take(limit).collect();
+        format!("{}...[truncated {}/{} chars]", truncated, limit, char_count)
+    }
 }
 
 /// Build a compact endpoint list from traffic rows for the AI prompt.
