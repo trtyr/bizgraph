@@ -1,0 +1,3 @@
+# Ideas Inbox
+
+- None yet.

@@ -45,7 +45,7 @@ pub enum ParameterLocation {
     Body,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParameterKind {
     DynamicSegment,
@@ -96,9 +96,12 @@ pub struct BusinessFunctionProperties {
     pub host: String,
     pub path_prefix: String,
     pub endpoint_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub enum BusinessNodeProperties {
     BusinessFunction(BusinessFunctionProperties),
@@ -191,7 +194,7 @@ pub struct AnalysisStats {
 pub struct AnalysisRecord {
     pub id: Uuid,
     pub project_id: Uuid,
-    pub excel_path: Option<String>,
+    pub source_path: Option<String>,
     pub host_filter: Option<String>,
     pub ai_report: Option<String>,
     pub row_count: usize,
@@ -199,6 +202,8 @@ pub struct AnalysisRecord {
     pub updated_nodes: usize,
     pub new_edges: usize,
     pub skipped_edges: usize,
+    /// JSON array of node stable_keys at analysis time, for diff comparison
+    pub node_snapshot: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

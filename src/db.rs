@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::PathBuf,
     sync::{Mutex, MutexGuard},
 };
@@ -9,23 +9,37 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
+use crate::{Error, Result};
 use crate::types::{
-    AnalysisRecord, AnalysisStats, BusinessEdge, BusinessGraph, BusinessNode, BusinessNodeKind,
-    BusinessNodeProperties, EndpointProperties, ParameterDescriptor, ParameterKind, Project,
+    AnalysisRecord, AnalysisStats, BusinessEdge, BusinessGraph,
+    BusinessNode, BusinessNodeKind, BusinessNodeProperties, EndpointProperties,
+    ParameterDescriptor, ParameterKind, Project,
 };
+
+/// Return `~/.config/bizgraph/`, creating the directory if it does not exist.
+fn global_config_dir() -> Result<PathBuf> {
+    let dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config/bizgraph");
+    std::fs::create_dir_all(&dir)
+        .map_err(|source| Error::io(format!("failed to create config dir {}", dir.display()), source))?;
+    Ok(dir)
+}
 
 pub struct Database {
     conn: Mutex<Connection>,
 }
 
 impl Database {
-    pub fn open_default() -> Result<Self, String> {
-        Self::open(PathBuf::from("bizgraph.db"))
+    pub fn open_default() -> Result<Self> {
+        let path = global_config_dir()?.join("bizgraph.db");
+        Self::open(path)
     }
 
-    pub fn open(path: PathBuf) -> Result<Self, String> {
-        let conn =
-            Connection::open(path).map_err(|e| format!("failed to open bizgraph database: {e}"))?;
+    pub fn open(path: PathBuf) -> Result<Self> {
+        let conn = Connection::open(path)
+            .map_err(|source| Error::sqlite("failed to open bizgraph database", source))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
@@ -69,19 +83,20 @@ impl Database {
                   created_at TEXT NOT NULL
               );",
         )
-        .map_err(|e| format!("failed to initialize bizgraph database: {e}"))?;
+        .map_err(|source| Error::sqlite("failed to initialize bizgraph database", source))?;
 
         ensure_analysis_ai_report_column(&conn)?;
+        ensure_analysis_node_snapshot_column(&conn)?;
 
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    pub fn create_project(&self, name: &str) -> Result<Project, String> {
+    pub fn create_project(&self, name: &str) -> Result<Project> {
         let name = name.trim();
         if name.is_empty() {
-            return Err("project name cannot be empty".to_string());
+            return Err(Error::EmptyProjectName);
         }
 
         let now = Utc::now();
@@ -100,34 +115,39 @@ impl Database {
                     project.created_at.to_rfc3339(),
                 ],
             )
-            .map_err(|e| {
-                if e.to_string().contains("UNIQUE") {
-                    format!("project '{}' already exists", name)
-                } else {
-                    format!("failed to create project '{}': {e}", name)
+            .map_err(|source| match &source {
+                rusqlite::Error::SqliteFailure(error, _)
+                    if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+                {
+                    Error::ProjectAlreadyExists {
+                        name: name.to_string(),
+                    }
                 }
+                _ => Error::sqlite(format!("failed to create project '{name}'"), source),
             })?;
 
         Ok(project)
     }
 
-    pub fn list_projects(&self) -> Result<Vec<Project>, String> {
+    pub fn list_projects(&self) -> Result<Vec<Project>> {
         let conn = self.c();
         let mut stmt = conn
             .prepare("SELECT id, name, created_at FROM projects ORDER BY created_at ASC, name ASC")
-            .map_err(|e| format!("failed to prepare project list query: {e}"))?;
+            .map_err(|source| Error::sqlite("failed to prepare project list query", source))?;
         let rows = stmt
             .query_map([], project_from_row)
-            .map_err(|e| format!("failed to list projects: {e}"))?;
+            .map_err(|source| Error::sqlite("failed to list projects", source))?;
 
         let mut projects = Vec::new();
         for row in rows {
-            projects.push(row.map_err(|e| format!("failed to decode project row: {e}"))?);
+            projects.push(
+                row.map_err(|source| Error::sqlite("failed to decode project row", source))?,
+            );
         }
         Ok(projects)
     }
 
-    pub fn get_project_by_name(&self, name: &str) -> Result<Option<Project>, String> {
+    pub fn get_project_by_name(&self, name: &str) -> Result<Option<Project>> {
         self.c()
             .query_row(
                 "SELECT id, name, created_at FROM projects WHERE name = ?1",
@@ -135,10 +155,10 @@ impl Database {
                 project_from_row,
             )
             .optional()
-            .map_err(|e| format!("failed to fetch project '{}': {e}", name))
+            .map_err(|source| Error::sqlite(format!("failed to fetch project '{name}'"), source))
     }
 
-    pub fn get_project(&self, id: Uuid) -> Result<Project, String> {
+    pub fn get_project(&self, id: Uuid) -> Result<Project> {
         self.c()
             .query_row(
                 "SELECT id, name, created_at FROM projects WHERE id = ?1",
@@ -146,14 +166,16 @@ impl Database {
                 project_from_row,
             )
             .optional()
-            .map_err(|e| format!("failed to fetch project '{id}': {e}"))?
-            .ok_or_else(|| format!("project '{id}' not found"))
+            .map_err(|source| Error::sqlite(format!("failed to fetch project '{id}'"), source))?
+            .ok_or_else(|| Error::ProjectNotFound {
+                reference: id.to_string(),
+            })
     }
 
-    pub fn resolve_project(&self, name_or_id: &str) -> Result<Option<Project>, String> {
+    pub fn resolve_project(&self, name_or_id: &str) -> Result<Option<Project>> {
         let value = name_or_id.trim();
         if value.is_empty() {
-            return Err("project name or id cannot be empty".to_string());
+            return Err(Error::EmptyProjectReference);
         }
 
         if let Some(project) = self.get_project_by_name(value)? {
@@ -162,10 +184,9 @@ impl Database {
 
         if let Ok(id) = Uuid::parse_str(value) {
             return self.get_project(id).map(Some).or_else(|error| {
-                if error.ends_with("not found") {
-                    Ok(None)
-                } else {
-                    Err(error)
+                match error {
+                    Error::ProjectNotFound { .. } => Ok(None),
+                    other => Err(other),
                 }
             });
         }
@@ -181,19 +202,14 @@ impl Database {
         match matches.len() {
             0 => Ok(None),
             1 => Ok(matches.into_iter().next()),
-            _ => Err(format!(
-                "project reference '{}' is ambiguous: {}",
-                value,
-                matches
-                    .iter()
-                    .map(|project| project.name.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
+            _ => Err(Error::AmbiguousProject {
+                reference: value.to_string(),
+                matches: matches.iter().map(|project| project.name.clone()).collect(),
+            }),
         }
     }
 
-    pub fn upsert_node(&self, project_id: Uuid, node: &BusinessNode) -> Result<bool, String> {
+    pub fn upsert_node(&self, project_id: Uuid, node: &BusinessNode) -> Result<bool> {
         let existing = self
             .c()
             .query_row(
@@ -202,15 +218,20 @@ impl Database {
                 |row| row.get::<_, String>(0),
             )
             .optional()
-            .map_err(|e| format!("failed to query business node '{}': {e}", node.stable_key))?;
+            .map_err(|source| {
+                Error::sqlite(
+                    format!("failed to query business node '{}'", node.stable_key),
+                    source,
+                )
+            })?;
 
         let now = Utc::now().to_rfc3339();
         if let Some(existing_properties) = existing {
-            let existing_properties: BusinessNodeProperties =
-                serde_json::from_str(&existing_properties).map_err(|e| {
-                    format!(
-                        "failed to parse stored node properties for '{}': {e}",
-                        node.stable_key
+            let existing_properties: BusinessNodeProperties = serde_json::from_str(&existing_properties)
+                .map_err(|source| {
+                    Error::json(
+                        format!("failed to parse stored node properties for '{}'", node.stable_key),
+                        source,
                     )
                 })?;
             let merged_properties =
@@ -224,15 +245,17 @@ impl Database {
                     params![
                         node.label,
                         node_kind_as_str(&node.kind),
-                        serde_json::to_string(&merged_properties).map_err(|e| format!(
-                            "failed to serialize merged node properties: {e}"
-                        ))?,
+                        serde_json::to_string(&merged_properties).map_err(|source| {
+                            Error::json("failed to serialize merged node properties", source)
+                        })?,
                         now,
                         project_id.to_string(),
                         node.stable_key,
                     ],
                 )
-                .map_err(|e| format!("failed to update node '{}': {e}", node.stable_key))?;
+                .map_err(|source| {
+                    Error::sqlite(format!("failed to update node '{}'", node.stable_key), source)
+                })?;
 
             Ok(false)
         } else {
@@ -248,18 +271,20 @@ impl Database {
                         node.label,
                         node_kind_as_str(&node.kind),
                         serde_json::to_string(&node.properties)
-                            .map_err(|e| format!("failed to serialize node properties: {e}"))?,
+                            .map_err(|source| Error::json("failed to serialize node properties", source))?,
                         now,
                         now,
                     ],
                 )
-                .map_err(|e| format!("failed to insert node '{}': {e}", node.stable_key))?;
+                .map_err(|source| {
+                    Error::sqlite(format!("failed to insert node '{}'", node.stable_key), source)
+                })?;
 
             Ok(true)
         }
     }
 
-    pub fn upsert_edge(&self, project_id: Uuid, edge: &BusinessEdge) -> Result<bool, String> {
+    pub fn upsert_edge(&self, project_id: Uuid, edge: &BusinessEdge) -> Result<bool> {
         let exists = self
             .c()
             .query_row(
@@ -273,7 +298,9 @@ impl Database {
                 |_| Ok(true),
             )
             .optional()
-            .map_err(|e| format!("failed to query business edge '{}': {e}", edge.id))?
+            .map_err(|source| {
+                Error::sqlite(format!("failed to query business edge '{}'", edge.id), source)
+            })?
             .unwrap_or(false);
 
         if exists {
@@ -292,11 +319,13 @@ impl Database {
                     edge.target_node_id.to_string(),
                     edge.label,
                     serde_json::to_string(&edge.properties)
-                        .map_err(|e| format!("failed to serialize edge properties: {e}"))?,
+                        .map_err(|source| Error::json("failed to serialize edge properties", source))?,
                     Utc::now().to_rfc3339(),
                 ],
             )
-            .map_err(|e| format!("failed to insert edge '{}': {e}", edge.id))?;
+            .map_err(|source| {
+                Error::sqlite(format!("failed to insert edge '{}'", edge.id), source)
+            })?;
 
         Ok(true)
     }
@@ -305,7 +334,7 @@ impl Database {
         &self,
         project_id: Uuid,
         graph: &BusinessGraph,
-    ) -> Result<AnalysisStats, String> {
+    ) -> Result<AnalysisStats> {
         let mut stats = AnalysisStats::default();
 
         for node in &graph.nodes {
@@ -328,7 +357,32 @@ impl Database {
         Ok(stats)
     }
 
-    pub fn get_graph(&self, project_id: Uuid) -> Result<BusinessGraph, String> {
+    /// Delete all business_function nodes and their edges for a project.
+    /// Used when AI identification replaces URL-based grouping.
+    pub fn clear_business_functions(&self, project_id: Uuid) -> Result<usize> {
+        let conn = self.c();
+        // Delete edges that reference business_function nodes
+        conn.execute(
+            "DELETE FROM business_edges WHERE project_id = ?1 AND (
+                source_node_id IN (SELECT id FROM business_nodes WHERE project_id = ?1 AND kind = 'business_function')
+                OR target_node_id IN (SELECT id FROM business_nodes WHERE project_id = ?1 AND kind = 'business_function')
+            )",
+            params![project_id.to_string()],
+        )
+        .map_err(|source| Error::sqlite("failed to delete business function edges", source))?;
+
+        // Delete the business_function nodes
+        let deleted = conn
+            .execute(
+                "DELETE FROM business_nodes WHERE project_id = ?1 AND kind = 'business_function'",
+                params![project_id.to_string()],
+            )
+            .map_err(|source| Error::sqlite("failed to delete business function nodes", source))?;
+
+        Ok(deleted)
+    }
+
+    pub fn get_graph(&self, project_id: Uuid) -> Result<BusinessGraph> {
         let nodes = {
             let conn = self.c();
             let mut stmt = conn
@@ -338,14 +392,16 @@ impl Database {
                      WHERE project_id = ?1
                      ORDER BY stable_key ASC",
                 )
-                .map_err(|e| format!("failed to prepare node query: {e}"))?;
+                .map_err(|source| Error::sqlite("failed to prepare node query", source))?;
             let rows = stmt
                 .query_map(params![project_id.to_string()], business_node_from_row)
-                .map_err(|e| format!("failed to query project graph nodes: {e}"))?;
+                .map_err(|source| Error::sqlite("failed to query project graph nodes", source))?;
 
             let mut nodes = Vec::new();
             for row in rows {
-                nodes.push(row.map_err(|e| format!("failed to decode stored node: {e}"))?);
+                nodes.push(
+                    row.map_err(|source| Error::sqlite("failed to decode stored node", source))?,
+                );
             }
             nodes
         };
@@ -359,14 +415,16 @@ impl Database {
                      WHERE project_id = ?1
                      ORDER BY label ASC, source_node_id ASC, target_node_id ASC",
                 )
-                .map_err(|e| format!("failed to prepare edge query: {e}"))?;
+                .map_err(|source| Error::sqlite("failed to prepare edge query", source))?;
             let rows = stmt
                 .query_map(params![project_id.to_string()], business_edge_from_row)
-                .map_err(|e| format!("failed to query project graph edges: {e}"))?;
+                .map_err(|source| Error::sqlite("failed to query project graph edges", source))?;
 
             let mut edges = Vec::new();
             for row in rows {
-                edges.push(row.map_err(|e| format!("failed to decode stored edge: {e}"))?);
+                edges.push(
+                    row.map_err(|source| Error::sqlite("failed to decode stored edge", source))?,
+                );
             }
             edges
         };
@@ -374,19 +432,59 @@ impl Database {
         Ok(BusinessGraph { nodes, edges })
     }
 
+    /// Get stable_key set of all endpoint nodes for a project.
+    /// Used for incremental analysis to detect new endpoints.
+    pub fn get_endpoint_keys(&self, project_id: Uuid) -> Result<HashSet<String>> {
+        let conn = self.c();
+        let mut stmt = conn
+            .prepare(
+                "SELECT stable_key FROM business_nodes
+                 WHERE project_id = ?1 AND kind = 'endpoint'",
+            )
+            .map_err(|source| Error::sqlite("failed to prepare endpoint key query", source))?;
+        let rows = stmt
+            .query_map(params![project_id.to_string()], |row| row.get::<_, String>(0))
+            .map_err(|source| Error::sqlite("failed to query endpoint keys", source))?;
+
+        let mut keys = HashSet::new();
+        for row in rows {
+            keys.insert(row.map_err(|source| Error::sqlite("failed to read endpoint key", source))?);
+        }
+        Ok(keys)
+    }
+
+    /// Get a summary of existing business functions for a project.
+    /// Returns (bf_label, description, endpoint_count) sorted by label.
+    pub fn get_business_function_summary(&self, project_id: Uuid) -> Result<Vec<(String, Option<String>, usize)>> {
+        let graph = self.get_graph(project_id)?;
+        let mut bfs: BTreeMap<String, (Option<String>, usize)> = BTreeMap::new();
+
+        for node in &graph.nodes {
+            if node.kind == BusinessNodeKind::BusinessFunction {
+                if let BusinessNodeProperties::BusinessFunction(props) = &node.properties {
+                    bfs.insert(node.label.clone(), (props.description.clone(), props.endpoint_count));
+                }
+            }
+        }
+
+        Ok(bfs.into_iter().map(|(label, (desc, count))| (label, desc, count)).collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn record_analysis(
         &self,
         project_id: Uuid,
-        excel_path: Option<&str>,
+        source_path: Option<&str>,
         host_filter: Option<&str>,
         ai_report: Option<&str>,
         row_count: usize,
         stats: &AnalysisStats,
-    ) -> Result<AnalysisRecord, String> {
+        node_snapshot: Option<&str>,
+    ) -> Result<AnalysisRecord> {
         let record = AnalysisRecord {
             id: Uuid::new_v4(),
             project_id,
-            excel_path: excel_path.map(ToString::to_string),
+            source_path: source_path.map(ToString::to_string),
             host_filter: host_filter.map(ToString::to_string),
             ai_report: ai_report.map(ToString::to_string),
             row_count,
@@ -394,18 +492,19 @@ impl Database {
             updated_nodes: stats.updated_nodes,
             new_edges: stats.new_edges,
             skipped_edges: stats.skipped_edges,
+            node_snapshot: node_snapshot.map(ToString::to_string),
             created_at: Utc::now(),
         };
 
         self.c()
             .execute(
                 "INSERT INTO analyses
-                 (id, project_id, excel_path, host_filter, row_count, new_nodes, updated_nodes, new_edges, skipped_edges, ai_report, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 (id, project_id, excel_path, host_filter, row_count, new_nodes, updated_nodes, new_edges, skipped_edges, ai_report, node_snapshot, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     record.id.to_string(),
                     record.project_id.to_string(),
-                    record.excel_path.as_deref(),
+                    record.source_path.as_deref(),
                     record.host_filter.as_deref(),
                     record.row_count as i64,
                     record.new_nodes as i64,
@@ -413,18 +512,19 @@ impl Database {
                     record.new_edges as i64,
                     record.skipped_edges as i64,
                     record.ai_report.as_deref(),
+                    record.node_snapshot.as_deref(),
                     record.created_at.to_rfc3339(),
                 ],
             )
-            .map_err(|e| format!("failed to record analysis: {e}"))?;
+            .map_err(|source| Error::sqlite("failed to record analysis", source))?;
 
         Ok(record)
     }
 
-    pub fn get_latest_analysis(&self, project_id: Uuid) -> Result<Option<AnalysisRecord>, String> {
+    pub fn get_latest_analysis(&self, project_id: Uuid) -> Result<Option<AnalysisRecord>> {
         self.c()
             .query_row(
-                "SELECT id, project_id, excel_path, host_filter, ai_report, row_count, new_nodes, updated_nodes, new_edges, skipped_edges, created_at
+                "SELECT id, project_id, excel_path, host_filter, ai_report, row_count, new_nodes, updated_nodes, new_edges, skipped_edges, node_snapshot, created_at
                  FROM analyses
                  WHERE project_id = ?1
                  ORDER BY created_at DESC
@@ -433,31 +533,48 @@ impl Database {
                 analysis_record_from_row,
             )
             .optional()
-            .map_err(|e| format!("failed to fetch latest analysis: {e}"))
+            .map_err(|source| Error::sqlite("failed to fetch latest analysis", source))
     }
 
-    pub fn get_analysis_history(&self, project_id: Uuid) -> Result<Vec<AnalysisRecord>, String> {
+    pub fn get_analysis_history(&self, project_id: Uuid) -> Result<Vec<AnalysisRecord>> {
         let conn = self.c();
         let mut stmt = conn
             .prepare(
-                "SELECT id, project_id, excel_path, host_filter, ai_report, row_count, new_nodes, updated_nodes, new_edges, skipped_edges, created_at
+                "SELECT id, project_id, excel_path, host_filter, ai_report, row_count, new_nodes, updated_nodes, new_edges, skipped_edges, node_snapshot, created_at
                  FROM analyses
                  WHERE project_id = ?1
                  ORDER BY created_at ASC",
             )
-            .map_err(|e| format!("failed to prepare analysis history query: {e}"))?;
+            .map_err(|source| Error::sqlite("failed to prepare analysis history query", source))?;
         let rows = stmt
             .query_map(params![project_id.to_string()], analysis_record_from_row)
-            .map_err(|e| format!("failed to query analysis history: {e}"))?;
+            .map_err(|source| Error::sqlite("failed to query analysis history", source))?;
 
         let mut history = Vec::new();
         for row in rows {
-            history.push(row.map_err(|e| format!("failed to decode analysis record: {e}"))?);
+            history.push(
+                row.map_err(|source| Error::sqlite("failed to decode analysis record", source))?,
+            );
         }
         Ok(history)
     }
 
-    fn refresh_business_function_counts(&self, project_id: Uuid) -> Result<(), String> {
+    /// Delete a project and all its associated data (nodes, edges, analyses).
+    pub fn delete_project(&self, project_id: Uuid) -> Result<()> {
+        let conn = self.c();
+        let id_str = project_id.to_string();
+        conn.execute("DELETE FROM business_edges WHERE project_id = ?1", params![id_str])
+            .map_err(|source| Error::sqlite("failed to delete project edges", source))?;
+        conn.execute("DELETE FROM business_nodes WHERE project_id = ?1", params![id_str])
+            .map_err(|source| Error::sqlite("failed to delete project nodes", source))?;
+        conn.execute("DELETE FROM analyses WHERE project_id = ?1", params![id_str])
+            .map_err(|source| Error::sqlite("failed to delete project analyses", source))?;
+        conn.execute("DELETE FROM projects WHERE id = ?1", params![id_str])
+            .map_err(|source| Error::sqlite("failed to delete project", source))?;
+        Ok(())
+    }
+
+    fn refresh_business_function_counts(&self, project_id: Uuid) -> Result<()> {
         let counts = {
             let conn = self.c();
             let mut stmt = conn
@@ -471,17 +588,21 @@ impl Database {
                      WHERE n.project_id = ?1 AND n.kind = 'business_function'
                      GROUP BY n.id",
                 )
-                .map_err(|e| format!("failed to prepare business function recount query: {e}"))?;
+                .map_err(|source| {
+                    Error::sqlite("failed to prepare business function recount query", source)
+                })?;
             let rows = stmt
                 .query_map(params![project_id.to_string()], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
                 })
-                .map_err(|e| format!("failed to query business function counts: {e}"))?;
+                .map_err(|source| Error::sqlite("failed to query business function counts", source))?;
 
             let mut counts = Vec::new();
             for row in rows {
                 counts.push(
-                    row.map_err(|e| format!("failed to decode business function count: {e}"))?,
+                    row.map_err(|source| {
+                        Error::sqlite("failed to decode business function count", source)
+                    })?,
                 );
             }
             counts
@@ -495,10 +616,14 @@ impl Database {
                     params![node_id, project_id.to_string()],
                     |row| row.get(0),
                 )
-                .map_err(|e| format!("failed to fetch business function properties: {e}"))?;
+                .map_err(|source| {
+                    Error::sqlite("failed to fetch business function properties", source)
+                })?;
 
             let mut properties: BusinessNodeProperties = serde_json::from_str(&properties)
-                .map_err(|e| format!("failed to parse business function properties: {e}"))?;
+                .map_err(|source| {
+                    Error::json("failed to parse business function properties", source)
+                })?;
 
             if let BusinessNodeProperties::BusinessFunction(ref mut details) = properties {
                 details.endpoint_count = endpoint_count.max(0) as usize;
@@ -506,15 +631,23 @@ impl Database {
                     .execute(
                         "UPDATE business_nodes SET properties = ?1, updated_at = ?2 WHERE id = ?3 AND project_id = ?4",
                         params![
-                            serde_json::to_string(&properties).map_err(|e| {
-                                format!("failed to serialize refreshed business function properties: {e}")
+                            serde_json::to_string(&properties).map_err(|source| {
+                                Error::json(
+                                    "failed to serialize refreshed business function properties",
+                                    source,
+                                )
                             })?,
                             Utc::now().to_rfc3339(),
                             node_id,
                             project_id.to_string(),
                         ],
                     )
-                    .map_err(|e| format!("failed to update refreshed business function counts: {e}"))?;
+                    .map_err(|source| {
+                        Error::sqlite(
+                            "failed to update refreshed business function counts",
+                            source,
+                        )
+                    })?;
             }
         }
 
@@ -565,7 +698,7 @@ fn analysis_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Analysi
     Ok(AnalysisRecord {
         id: parse_uuid_field(row.get::<_, String>(0)?).map_err(to_sql_conversion_error)?,
         project_id: parse_uuid_field(row.get::<_, String>(1)?).map_err(to_sql_conversion_error)?,
-        excel_path: row.get(2)?,
+        source_path: row.get(2)?,
         host_filter: row.get(3)?,
         ai_report: row.get(4)?,
         row_count: row.get::<_, i64>(5)?.max(0) as usize,
@@ -573,22 +706,24 @@ fn analysis_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Analysi
         updated_nodes: row.get::<_, i64>(7)?.max(0) as usize,
         new_edges: row.get::<_, i64>(8)?.max(0) as usize,
         skipped_edges: row.get::<_, i64>(9)?.max(0) as usize,
-        created_at: parse_datetime_field(row.get::<_, String>(10)?)
+        node_snapshot: row.get(10)?,
+        created_at: parse_datetime_field(row.get::<_, String>(11)?)
             .map_err(to_sql_conversion_error)?,
     })
 }
 
-fn ensure_analysis_ai_report_column(conn: &Connection) -> Result<(), String> {
+fn ensure_analysis_ai_report_column(conn: &Connection) -> Result<()> {
     let mut stmt = conn
         .prepare("PRAGMA table_info(analyses)")
-        .map_err(|e| format!("failed to inspect analyses schema: {e}"))?;
+        .map_err(|source| Error::sqlite("failed to inspect analyses schema", source))?;
     let columns = stmt
         .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|e| format!("failed to read analyses schema: {e}"))?;
+        .map_err(|source| Error::sqlite("failed to read analyses schema", source))?;
 
     let mut has_ai_report = false;
     for column in columns {
-        if column.map_err(|e| format!("failed to decode analyses schema row: {e}"))? == "ai_report"
+        if column.map_err(|source| Error::sqlite("failed to decode analyses schema row", source))?
+            == "ai_report"
         {
             has_ai_report = true;
             break;
@@ -597,20 +732,46 @@ fn ensure_analysis_ai_report_column(conn: &Connection) -> Result<(), String> {
 
     if !has_ai_report {
         conn.execute("ALTER TABLE analyses ADD COLUMN ai_report TEXT", [])
-            .map_err(|e| format!("failed to migrate analyses.ai_report: {e}"))?;
+            .map_err(|source| Error::sqlite("failed to migrate analyses.ai_report", source))?;
     }
 
     Ok(())
 }
 
-fn parse_uuid_field(value: String) -> Result<Uuid, String> {
-    Uuid::parse_str(&value).map_err(|e| format!("invalid uuid '{value}': {e}"))
+fn ensure_analysis_node_snapshot_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(analyses)")
+        .map_err(|source| Error::sqlite("failed to inspect analyses schema", source))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|source| Error::sqlite("failed to read analyses schema", source))?;
+
+    let mut has_column = false;
+    for column in columns {
+        if column.map_err(|source| Error::sqlite("failed to decode analyses schema row", source))?
+            == "node_snapshot"
+        {
+            has_column = true;
+            break;
+        }
+    }
+
+    if !has_column {
+        conn.execute("ALTER TABLE analyses ADD COLUMN node_snapshot TEXT", [])
+            .map_err(|source| Error::sqlite("failed to migrate analyses.node_snapshot", source))?;
+    }
+
+    Ok(())
 }
 
-fn parse_datetime_field(value: String) -> Result<DateTime<Utc>, String> {
+fn parse_uuid_field(value: String) -> Result<Uuid> {
+    Uuid::parse_str(&value).map_err(|source| Error::InvalidUuidValue { value, source })
+}
+
+fn parse_datetime_field(value: String) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&value)
         .map(|parsed| parsed.with_timezone(&Utc))
-        .map_err(|e| format!("invalid timestamp '{value}': {e}"))
+        .map_err(|source| Error::InvalidTimestampValue { value, source })
 }
 
 fn to_sql_conversion_error(error: impl ToString) -> rusqlite::Error {
@@ -624,12 +785,14 @@ fn to_sql_conversion_error(error: impl ToString) -> rusqlite::Error {
     )
 }
 
-fn parse_node_kind(value: &str) -> Result<BusinessNodeKind, String> {
+fn parse_node_kind(value: &str) -> Result<BusinessNodeKind> {
     match value {
         "host" => Ok(BusinessNodeKind::Host),
         "business_function" => Ok(BusinessNodeKind::BusinessFunction),
         "endpoint" => Ok(BusinessNodeKind::Endpoint),
-        _ => Err(format!("unknown business node kind '{value}'")),
+        _ => Err(Error::InvalidNodeKind {
+            value: value.to_string(),
+        }),
     }
 }
 
@@ -657,6 +820,9 @@ fn merge_node_properties(
             existing.host = incoming.host;
             existing.path_prefix = incoming.path_prefix;
             existing.endpoint_count = existing.endpoint_count.max(incoming.endpoint_count);
+            if incoming.description.is_some() {
+                existing.description = incoming.description;
+            }
             BusinessNodeProperties::BusinessFunction(existing)
         }
         (BusinessNodeProperties::Host(mut existing), BusinessNodeProperties::Host(incoming)) => {
