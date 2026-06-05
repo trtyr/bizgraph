@@ -840,17 +840,31 @@ body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Ro
 </head>
 <body>
 "#);
-    html.push_str(&format!(r#"<div id="controls">
-  <h3>{project_name}</h3>
-  <label><input type="checkbox" id="showEndpoints" onchange="toggleEndpoints()"> 显示 Endpoints</label>
-  <label><input type="checkbox" id="showDescriptions" checked onchange="toggleDescriptions()"> 显示业务描述</label>
+    html.push_str(r#"<div id="controls">
+  <h3>"#);
+    html.push_str(project_name);
+    html.push_str(r#"</h3>
+  <label><input type="checkbox" id="showEndpoints" onchange="toggleEndpoints()"> Endpoints</label>
+  <label><input type="checkbox" id="showDescriptions" checked onchange="toggleDescriptions()"> 业务描述</label>
+  <label><input type="checkbox" id="showFlow" checked onchange="toggleFlow()"> 调用顺序</label>
+  <label><input type="checkbox" id="showDeps" checked onchange="toggleDeps()"> 数据依赖</label>
   <div class="legend">
     <div class="legend-item"><div class="legend-color" style="background:#4A90D9"></div> Host</div>
     <div class="legend-item"><div class="legend-color" style="background:#7BC67E"></div> 业务功能</div>
     <div class="legend-item"><div class="legend-color" style="background:#F5A623"></div> Endpoint</div>
+    <div class="legend-item"><div class="legend-color" style="background:#999"></div> contains</div>
+    <div class="legend-item"><div class="legend-color" style="background:#4A90D9"></div> calls_after</div>
+    <div class="legend-item"><div class="legend-color" style="background:#E74C3C"></div> data_dependency</div>
   </div>
 </div>
-"#));
+<div id="detail-panel" style="display:none; position:fixed; top:16px; right:16px; z-index:20; background:rgba(30,30,60,0.95); padding:16px 20px; border-radius:8px; box-shadow:0 2px 12px rgba(0,0,0,0.4); max-width:400px; max-height:80vh; overflow-y:auto; font-size:13px; line-height:1.6;">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+    <h3 id="detail-title" style="margin:0; color:#7BC67E;"></h3>
+    <span onclick="closeDetail()" style="cursor:pointer; color:#999; font-size:18px;">✕</span>
+  </div>
+  <div id="detail-content"></div>
+</div>
+"#);
     html.push_str("<div id=\"stats\"></div>\n<div id=\"graph\"></div>\n<script>\n");
     html.push_str(&format!("const DATA = {data_json};\n\n"));
     html.push_str(r#"const colors = { host: '#4A90D9', business_function: '#7BC67E', endpoint: '#F5A623' };
@@ -876,13 +890,15 @@ const visNodes = DATA.nodes.map(n => {
   };
 });
 
-const visEdges = DATA.edges.map(e => ({
-  from: e.from,
-  to: e.to,
-  color: { color: '#999', opacity: 0.6 },
-  arrows: 'to',
-  smooth: { type: 'cubicBezier' },
-}));
+const edgeStyles = {
+  hierarchy: { color: { color: '#999', opacity: 0.5 }, dashes: false, arrows: 'to', width: 1, smooth: { type: 'cubicBezier' } },
+  flow: { color: { color: '#4A90D9', opacity: 0.8 }, dashes: false, arrows: 'to', width: 2, smooth: { type: 'cubicBezier' }, font: { color: '#4A90D9', size: 9, strokeWidth: 0 } },
+  dependency: { color: { color: '#E74C3C', opacity: 0.7 }, dashes: [5, 5], arrows: 'to', width: 1.5, smooth: { type: 'cubicBezier' }, font: { color: '#E74C3C', size: 9, strokeWidth: 0 } },
+};
+const visEdges = DATA.edges.map(e => {
+  const style = edgeStyles[e.edge_type] || edgeStyles.hierarchy;
+  return { id: e.from + '->' + e.to + ':' + e.edge_type, from: e.from, to: e.to, label: e.edge_type !== 'hierarchy' ? e.label : undefined, edge_type: e.edge_type, ...style };
+});
 
 const container = document.getElementById('graph');
 const nodeDS = new vis.DataSet(visNodes);
@@ -907,12 +923,9 @@ document.getElementById('stats').innerHTML =
 
 window.toggleEndpoints = function() {
   const show = document.getElementById('showEndpoints').checked;
-  const updates = DATA.nodes.filter(n => n.kind === 'endpoint').map(n => ({
-    id: n.id, hidden: !show
-  }));
+  const updates = DATA.nodes.filter(n => n.kind === 'endpoint').map(n => ({ id: n.id, hidden: !show }));
   nodeDS.update(updates);
 };
-
 window.toggleDescriptions = function() {
   const show = document.getElementById('showDescriptions').checked;
   const updates = DATA.nodes.filter(n => n.kind === 'business_function').map(n => ({
@@ -921,6 +934,57 @@ window.toggleDescriptions = function() {
   }));
   nodeDS.update(updates);
 };
+window.toggleFlow = function() {
+  const show = document.getElementById('showFlow').checked;
+  const allEdges = edgeDS.get();
+  const updates = allEdges.filter(e => e.edge_type === 'flow').map(e => ({ id: e.id, hidden: !show }));
+  edgeDS.update(updates);
+};
+window.toggleDeps = function() {
+  const show = document.getElementById('showDeps').checked;
+  const allEdges = edgeDS.get();
+  const updates = allEdges.filter(e => e.edge_type === 'dependency').map(e => ({ id: e.id, hidden: !show }));
+  edgeDS.update(updates);
+};
+window.closeDetail = function() {
+  document.getElementById('detail-panel').style.display = 'none';
+};
+network.on('click', function(params) {
+  if (params.nodes.length > 0) {
+    const nodeId = params.nodes[0];
+    const node = DATA.nodes.find(n => n.id === nodeId);
+    if (node) showNodeDetail(node);
+  } else {
+    closeDetail();
+  }
+});
+function showNodeDetail(node) {
+  const panel = document.getElementById('detail-panel');
+  const title = document.getElementById('detail-title');
+  const content = document.getElementById('detail-content');
+  title.textContent = node.label;
+  let h = '<div style="color:#aaa;margin-bottom:8px;">Type: ' + node.kind + '</div>';
+  if (node.description) h += '<div style="margin-bottom:8px;">' + node.description.replace(/\n/g, '<br>') + '</div>';
+  if (node.details) {
+    const d = node.details;
+    h += '<div style="border-top:1px solid #333;padding-top:8px;margin-top:4px;">';
+    for (const [k, v] of Object.entries(d)) {
+      if (v && v !== '' && v !== 0) h += '<div><span style="color:#888;">' + k + ':</span> ' + (typeof v === 'object' ? JSON.stringify(v) : v) + '</div>';
+    }
+    h += '</div>';
+  }
+  const outE = DATA.edges.filter(e => e.from === node.id);
+  const inE = DATA.edges.filter(e => e.to === node.id);
+  if (outE.length + inE.length > 0) {
+    h += '<div style="border-top:1px solid #333;padding-top:8px;margin-top:8px;">';
+    h += '<div style="color:#888;margin-bottom:4px;">Connections:</div>';
+    outE.forEach(e => { const t = DATA.nodes.find(n => n.id === e.to); h += '<div style="color:#4A90D9;">\u2192 ' + e.edge_type + ': ' + (t ? t.label : e.to) + '</div>'; });
+    inE.forEach(e => { const s = DATA.nodes.find(n => n.id === e.from); h += '<div style="color:#E74C3C;">\u2190 ' + e.edge_type + ': ' + (s ? s.label : e.from) + '</div>'; });
+    h += '</div>';
+  }
+  content.innerHTML = h;
+  panel.style.display = 'block';
+}
 </script>
 </body>
 </html>"#);
