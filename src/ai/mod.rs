@@ -38,7 +38,7 @@ pub async fn analyze_with_ai(
         )),
     ];
 
-    chat::chat_fresh(messages, api_key, model, api_url).await
+    chat::chat_fresh(messages, api_key, model, api_url, None).await
 }
 
 /// Deep multi-phase AI analysis. If `business_context` is provided, the agent
@@ -49,6 +49,7 @@ pub async fn analyze_with_ai_deep(
     model: &str,
     api_url: &str,
     business_context: Option<&str>,
+    token_budget: usize,
 ) -> Result<String> {
-    agent::run_agent(graph, api_key, model, api_url, business_context).await
+    agent::run_agent(graph, api_key, model, api_url, business_context, token_budget).await
 }

@@ -7,7 +7,7 @@ pub mod types;
 
 use std::{env, fs, path::PathBuf};
 
-use ai::{analyze_with_ai, analyze_with_ai_deep, identify_business_functions};
+use ai::{analyze_with_ai, analyze_with_ai_deep, identify_business_functions, AGENT_STATE_TOKEN_LIMIT};
 pub use db::Database;
 pub use error::{Error, Result};
 use graph::{build_business_graph, build_business_graph_from_ai, is_static_resource, normalize_path_template};
@@ -21,6 +21,9 @@ struct Config {
     model: Option<String>,
     #[serde(default)]
     api_url: Option<String>,
+    /// Optional token budget for AI agent state (default: 100000)
+    #[serde(default)]
+    token_budget: Option<usize>,
 }
 
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
@@ -57,7 +60,7 @@ pub async fn analyze_with_ai_report(
     };
 
     let report = if deep {
-        analyze_with_ai_deep(&graph, api_key, model, api_url, business_context.as_deref()).await?
+        analyze_with_ai_deep(&graph, api_key, model, api_url, business_context.as_deref(), load_token_budget()).await?
     } else {
         analyze_with_ai(&graph, api_key, model, api_url).await?
     };
@@ -144,27 +147,21 @@ pub async fn analyze_with_project(
     stats.row_count = rows.len();
     let graph = db.get_graph(project.id)?;
 
-    // Step 2: AI deep analysis — skip if incremental with no new endpoints
-    let ai_report = if new_rows.is_empty() && is_incremental {
-        // No new data — reuse latest existing AI report
-        db.get_latest_analysis(project.id)?
-            .and_then(|r| r.ai_report)
-            .or_else(|| ai_report.map(|s| s.to_string()))
-    } else {
-        match (ai_report, api_key_option) {
-            (Some(report), _) => Some(report.to_string()),
-            (None, Some(api_key)) => Some(
-                analyze_with_ai_deep(
-                    &graph,
-                    api_key,
-                    model_option.unwrap_or(DEFAULT_MODEL),
-                    api_url_option.unwrap_or(DEFAULT_API_URL),
-                    business_context.as_deref(),
-                )
-                .await?,
-            ),
-            (None, None) => None,
-        }
+    // Step 2: AI deep analysis — always run if API key is available
+    let ai_report = match (ai_report, api_key_option) {
+        (Some(report), _) => Some(report.to_string()),
+        (None, Some(api_key)) => Some(
+            analyze_with_ai_deep(
+                &graph,
+                api_key,
+                model_option.unwrap_or(DEFAULT_MODEL),
+                api_url_option.unwrap_or(DEFAULT_API_URL),
+                business_context.as_deref(),
+                load_token_budget(),
+            )
+            .await?,
+        ),
+        (None, None) => None,
     };
 
     // Build node snapshot for diff comparison
@@ -203,21 +200,14 @@ fn build_business_context(identification: &ai::BusinessIdentification) -> String
 
 /// Load API configuration from `~/.config/bizgraph/config.toml`.
 ///
-/// Also checks `BIZGRAPH_API_KEY` env var as fallback for the API key.
 /// Returns `(api_key, model, api_url)`.
 pub fn load_config() -> Result<(String, String, String)> {
     let config = read_config_from_path(config_path_in_home())?;
 
-    // Check env var first, then config file
-    let api_key = env::var("BIZGRAPH_API_KEY")
-        .ok()
-        .and_then(|v| normalize_config_value(&v))
-        .or_else(|| {
-            config
-                .as_ref()
-                .and_then(|config| config.api_key.as_deref())
-                .and_then(normalize_config_value)
-        })
+    let api_key = config
+        .as_ref()
+        .and_then(|config| config.api_key.as_deref())
+        .and_then(normalize_config_value)
         .ok_or(Error::ConfigMissingApiKey)?;
 
     let model = config
@@ -237,6 +227,15 @@ pub fn load_config() -> Result<(String, String, String)> {
 
 pub fn load_api_key() -> Result<String> {
     load_config().map(|(api_key, _, _)| api_key)
+}
+
+/// Load token budget from config. Returns default (100000) if not configured.
+pub fn load_token_budget() -> usize {
+    read_config_from_path(config_path_in_home())
+        .ok()
+        .flatten()
+        .and_then(|c| c.token_budget)
+        .unwrap_or(AGENT_STATE_TOKEN_LIMIT)
 }
 
 /// Try to load API config. Returns None if no API key is configured (not an error).

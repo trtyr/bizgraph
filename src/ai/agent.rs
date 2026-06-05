@@ -110,6 +110,13 @@ impl AgentState {
         refresh_token_budget(&mut state);
         state
     }
+
+    pub fn new_with_budget(graph: &BusinessGraph, budget: usize) -> Self {
+        let mut state = Self::new(graph);
+        state.token_budget.limit = budget;
+        refresh_token_budget(&mut state);
+        state
+    }
 }
 
 pub async fn run_agent(
@@ -118,8 +125,9 @@ pub async fn run_agent(
     model: &str,
     api_url: &str,
     business_context: Option<&str>,
+    token_budget: usize,
 ) -> Result<String> {
-    let mut state = AgentState::new(graph);
+    let mut state = AgentState::new_with_budget(graph, token_budget);
     let mut calls_made = 0usize;
 
     // Build context preamble with business identification if available
@@ -127,19 +135,22 @@ pub async fn run_agent(
         .map(|ctx| format!("BUSINESS CONTEXT (pre-identified business functions):\n{ctx}\n\n"))
         .unwrap_or_default();
 
+    let phase_start = std::time::Instant::now();
     eprintln!("Phase 1/3: Business overview...");
     let overview_input = format!("{context_preamble}{}", build_graph_overview(graph));
     let overview_context = build_turn_context(&state, "OVERVIEW", &overview_input);
-    let overview = chat_fresh(overview_context, api_key, model, api_url).await?;
+    let overview = chat_fresh(overview_context, api_key, model, api_url, None).await?;
     calls_made += 1;
     record_turn(&mut state, "overview", None, &overview);
     update_state_from_overview(graph, &mut state, &overview);
     parse_observations_into_state(&mut state, None, &overview)?;
+    eprintln!("  ✓ Phase 1 complete ({}ms)", phase_start.elapsed().as_millis());
 
     state.phase = "domain".to_string();
     let domain_budget = MAX_DEEP_AI_CALLS.saturating_sub(3);
     let selected_domains: Vec<_> = state.domains.iter().take(domain_budget).cloned().collect();
 
+    let phase2_start = std::time::Instant::now();
     eprintln!(
         "Phase 2/3: Deep-diving {} prioritized domains in parallel...",
         selected_domains.len()
@@ -148,13 +159,14 @@ pub async fn run_agent(
     for domain in &selected_domains {
         let name = domain.name.clone();
         let detail = build_function_detail(&name, graph);
-        let context = build_turn_context(&state, "DOMAIN_DEEP_DIVE", &detail);
+        // Phase 2: no history accumulation — each domain gets only its own scoped data
+        let context = build_scoped_turn_context("DOMAIN_DEEP_DIVE", &detail);
         let api_key = api_key.to_string();
         let model = model.to_string();
         let api_url = api_url.to_string();
         domain_tasks.push(tokio::spawn(async move {
             eprintln!("  > Analyzing domain: {name}");
-            let response = chat_fresh(context, &api_key, &model, &api_url).await?;
+            let response = chat_fresh(context, &api_key, &model, &api_url, None).await?;
             Ok::<_, Error>((name, response))
         }));
     }
@@ -164,10 +176,14 @@ pub async fn run_agent(
         match task.await {
             Ok(Ok((domain, response))) => {
                 calls_made += 1;
-                record_turn(&mut state, "domain", Some(&domain), &response);
+                // Don't store full response in state — only extract structured findings
+                // Full response is discarded after extraction to keep state under token budget
                 if let Err(error) = parse_observations_into_state(&mut state, Some(&domain), &response) {
                     eprintln!("  Warning: failed to parse observations for {domain}: {error}");
                 }
+                // Store only a compact summary, not the full response
+                let compact = summarize_text(&response, FINDING_SUMMARY_CHAR_LIMIT);
+                record_turn(&mut state, "domain", Some(&domain), &compact);
                 eprintln!(
                     "  Done [{}/{}] {}",
                     i + 1,
@@ -195,15 +211,16 @@ pub async fn run_agent(
     }
 
     state.phase = "cross_final".to_string();
+    eprintln!("  ✓ Phase 2 complete ({}ms)", phase2_start.elapsed().as_millis());
+    let phase3_start = std::time::Instant::now();
     eprintln!("Phase 3/3: Cross-domain correlation & final report...");
     force_summarize_context(&mut state, api_key, model, api_url).await?;
-    let cross_final_data = format!(
-        "{}\n\n---\n\n{}",
-        build_cross_summary(&state, graph),
-        render_state_for_final(&state)
-    );
-    let cross_final_context = build_turn_context(&state, "CROSS_FINAL", &cross_final_data);
-    let report = chat_fresh(cross_final_context, api_key, model, api_url).await?;
+    // Only send cross_summary — it already contains domain summaries, cross-cutting,
+    // session contexts, and open questions. No need to repeat the full state.
+    let cross_final_data = build_cross_summary(&state, graph);
+    // Phase 3: use scoped context — cross_final_data already contains all needed findings
+    let cross_final_context = build_scoped_turn_context("CROSS_FINAL", &cross_final_data);
+    let report = chat_fresh(cross_final_context, api_key, model, api_url, Some(super::chat::PHASE3_REQUEST_TIMEOUT)).await?;
     calls_made += 1;
 
     if calls_made > MAX_DEEP_AI_CALLS {
@@ -214,6 +231,8 @@ pub async fn run_agent(
         });
     }
 
+    eprintln!("  ✓ Phase 3 complete ({}ms)", phase3_start.elapsed().as_millis());
+    eprintln!("AI analysis total: {}ms", phase_start.elapsed().as_millis());
     Ok(extract_final_report(&report))
 }
 
@@ -256,52 +275,98 @@ fn build_turn_context(state: &AgentState, task: &str, data: &str) -> Vec<ChatMes
     ]
 }
 
+
+/// Lightweight turn context — no accumulated history, just the task + data.
+/// Used for Phase 2 domain deep-dives to avoid blowing the token budget.
+fn build_scoped_turn_context(task: &str, data: &str) -> Vec<ChatMessage> {
+    let char_count = data.chars().count();
+    let data = if char_count > TURN_DATA_CHAR_LIMIT {
+        eprintln!(
+            "Warning: task {task} context payload is {char_count} chars, above limit {TURN_DATA_CHAR_LIMIT}; truncating."
+        );
+        let truncated: String = data.chars().take(TURN_DATA_CHAR_LIMIT).collect();
+        format!("{truncated}\n\n[truncated — {char_count} chars total, showing first {TURN_DATA_CHAR_LIMIT}]")
+    } else {
+        data.to_string()
+    };
+
+    vec![
+        ChatMessage::system(AGENT_IDENTITY_PROMPT),
+        ChatMessage::user(format!(
+            "Task: {task}\n\n{}\n\nData:\n{data}",
+            build_task_instruction(task)
+        )),
+    ]
+}
+
 fn build_task_instruction(task: &str) -> &'static str {
     match task {
         "OVERVIEW" => {
-            "Analyze the graph overview to identify business domains.\n\n\
-             Required output:\n\
-             1. List each business domain with its purpose (1-2 sentences)\n\
-             2. Rank domains by business importance (not just endpoint count)\n\
-             3. Identify cross-cutting concerns (auth, logging, shared services)\n\
-             4. Note any patterns in the endpoint structure\n\n\
-             Return Markdown with clear ## headings per domain."
+            "Analyze the graph overview to identify business domains and answer these questions:\n\n\
+             1. What businesses does this application provide? (Q1)\n\
+             2. How many endpoints does each business have? (Q2 prep)\n\
+             3. What cross-cutting concerns exist? (auth, logging, shared services) (Q6 prep)\n\
+             4. What patterns exist in the endpoint structure? (Q4/Q5 prep)\n\n\
+             Return Markdown with clear ## headings per domain.\n\
+             For each domain: name, purpose, endpoint count, key endpoints, cross-cutting notes."
         }
         "DOMAIN_DEEP_DIVE" => {
-            "Deep-dive into a single business domain.\n\n\
-             Required output:\n\
-             1. Domain purpose — what business function does it serve?\n\
-             2. Endpoint catalog — for each endpoint:\n\
-                - What it does (action + data)\n\
-                - Input parameters and their meaning\n\
-                - Response structure and key fields\n\
-                - Role in the user workflow\n\
-             3. Data flow — what data enters, transforms, and exits this domain\n\
-             4. Internal relationships — how endpoints within this domain connect\n\n\
-             Cite specific endpoint paths, methods, and parameters as evidence."
+            "Deep-dive into a single business domain. Answer:\n\n\
+             1. What does this domain do? (Q2: endpoint catalog)\n\
+             2. For each endpoint:\n\
+                - What it does (action + data) — Q3\n\
+                - Input parameters and their meaning — Q3\n\
+                - Response structure and key fields — Q3\n\
+                - Role in the user workflow — Q3/Q7\n\
+             3. What is the call sequence within this domain? (Q4)\n\
+                - Which endpoints are called first? What follows?\n\
+                - Identify typical order: auth -> list -> detail -> create/update/delete\n\
+             4. What data flows between endpoints? (Q5)\n\
+                - Which endpoint outputs are used as inputs to others?\n\
+                - Map token/session/ID propagation chains\n\
+             5. What are the key business-critical endpoints? (Q8)\n\
+                - Authentication/authorization endpoints\n\
+                - Admin/management endpoints\n\
+                - Data export/download endpoints\n\
+                - Configuration/settings endpoints\n\n\
+             Cite specific endpoint paths, methods, and parameters as evidence.\n\
+             Use this format for each domain:\n\
+             ### Domain: [name]\n\
+             **Purpose**: ...\n\
+             **Endpoints**: [table with method, path, purpose, params]\n\
+             **Call Sequence**: [ordered list showing typical flow]\n\
+             **Data Dependencies**: [which endpoints share what data]\n\
+             **Key Endpoints**: [business-critical endpoints and why]"
         }
         "CROSS_FINAL" => {
-            "Two-part task:\n\n\
-             Part 1 — Cross-domain correlation:\n\
-             - How do business functions connect? What data flows between modules?\n\
-             - What are the key user journeys that span multiple domains?\n\
-             - Are there shared data entities across domains?\n\n\
-             Part 2 — Final report:\n\
-             - Executive summary (3-5 sentences)\n\
-             - Business functions overview (grouped by domain)\n\
-             - User flow analysis (key journeys)\n\
-             - Data flow map (how data moves through the system)\n\
-             - Endpoint purpose catalog (each endpoint's role)\n\n\
-             Return a polished Markdown report with all sections populated."
+            "Compile the final business analysis report. You have all domain findings.\n\n\
+             Answer these questions comprehensively:\n\n\
+             Q6: How do business domains relate? What data/infrastructure do they share?\n\
+             Q7: What are the 2-4 core end-to-end user journeys? (login->browse->export, etc.)\n\
+             Q8: Which endpoints are the most business-critical across all domains?\n\n\
+             Then compile the full report with ALL 8 sections:\n\
+             ## 1. Business Overview — what does this application do?\n\
+             ## 2. Endpoint Catalog by Business — grouped by domain\n\
+             ## 3. Endpoint Purpose Analysis — each endpoint's role\n\
+             ## 4. Call Sequence & Flow — typical call order across domains\n\
+             ## 5. Data Dependencies — shared tokens, IDs, parameters\n\
+             ## 6. Cross-Business Relationships — how domains connect\n\
+             ## 7. Core Business Flows — end-to-end user journeys\n\
+             ## 8. Key Business Endpoints — most critical endpoints and why\n\n\
+             Return a polished Markdown report with all 8 sections populated.\n\
+             Do NOT use words like vulnerability, exploit, bypass, injection, attack."
         }
         "FINAL_REPORT" => {
             "Compile a comprehensive business understanding report.\n\n\
-             Required sections:\n\
-             1. Executive Summary — what does this application do?\n\
-             2. Business Functions — grouped by domain, with endpoint details\n\
-             3. User Flow Analysis — key user journeys through the system\n\
-             4. Data Flow Map — how data moves between modules\n\
-             5. Endpoint Purpose Catalog — each endpoint's role and data\n\n\
+             Required sections (all 8):\n\
+             1. Business Overview — what does this application do?\n\
+             2. Endpoint Catalog by Business — grouped by domain, with endpoint details\n\
+             3. Endpoint Purpose Analysis — each endpoint's role and data\n\
+             4. Call Sequence & Flow — typical call order\n\
+             5. Data Dependencies — how data flows between endpoints\n\
+             6. Cross-Business Relationships — how domains connect\n\
+             7. Core Business Flows — end-to-end user journeys\n\
+             8. Key Business Endpoints — most critical endpoints\n\n\
              Return polished Markdown."
         }
         _ => "Analyze the supplied business-graph context and respond in natural Markdown.",
@@ -377,7 +442,7 @@ async fn force_summarize_context(
         stream: false,
     };
 
-    let summary = send_chat_request(&request, api_key, api_url)
+    let summary = send_chat_request(&request, api_key, api_url, None)
         .await
         .map_err(|error| match error {
             Error::ApiRequest { source, .. } => Error::ApiRequest {
@@ -527,56 +592,7 @@ fn render_state_snapshot(state: &AgentState) -> String {
     out
 }
 
-fn render_state_for_final(state: &AgentState) -> String {
-    let mut out = String::new();
-    out.push_str("BizGraph structured analysis state for final report\n\n");
-    out.push_str(&format!(
-        "Phase: {}\nToken budget: {}/{}\n\n",
-        state.phase, state.token_budget.used, state.token_budget.limit
-    ));
-    out.push_str("Business domains:\n");
-    for domain in &state.domains {
-        out.push_str(&format!(
-            "- priority={} | {} | endpoints={} | analyzed={} | summary={}\n",
-            domain.priority,
-            domain.name,
-            domain.endpoint_count,
-            domain.analyzed,
-            domain.observations_summary.as_deref().unwrap_or("pending")
-        ));
-    }
-
-    out.push_str("\nStructured business observations:\n");
-    if state.observations.is_empty() {
-        out.push_str("- none\n");
-    } else {
-        for observation in &state.observations {
-            out.push_str(&format!(
-                "- title={} | endpoints={} | evidence={} | notes={}\n",
-                observation.title,
-                join_or_none(&observation.endpoints),
-                observation.evidence,
-                observation.notes
-            ));
-        }
-    }
-
-    out.push_str("\nCross-cutting observations:\n");
-    if state.cross_cutting.is_empty() {
-        out.push_str("- none\n");
-    } else {
-        for item in &state.cross_cutting {
-            out.push_str(&format!("- {}\n", item));
-        }
-    }
-
-    out.push_str(&format!(
-        "\nProgress summary:\n- completed: {}\n- remaining: {}\n",
-        join_or_none(&state.progress.completed),
-        join_or_none(&state.progress.remaining)
-    ));
-    out
-}
+// render_state_for_final removed — build_cross_summary covers all needed data
 
 fn parse_prioritized_domains_from_overview(
     graph: &BusinessGraph,

@@ -297,7 +297,7 @@ IMPORTANT:
         chat::ChatMessage::user(prompt),
     ];
 
-    let response = chat::chat_fresh(messages, api_key, model, api_url).await?;
+    let response = chat::chat_fresh(messages, api_key, model, api_url, None).await?;
 
     // Try to parse the response as JSON
     let cleaned = clean_json_response(&response);

@@ -671,7 +671,6 @@ fn print_bf_node(
 fn generate_viz_html(graph: &bizgraph::types::BusinessGraph, project_name: &str) -> String {
     use bizgraph::types::{BusinessNodeKind, BusinessNodeProperties};
 
-    // Build JSON data for the visualization
     let mut nodes_json = Vec::new();
     let mut edges_json = Vec::new();
 
@@ -694,7 +693,8 @@ fn generate_viz_html(graph: &bizgraph::types::BusinessGraph, project_name: &str)
             "id": format!("host:{host}"),
             "label": host,
             "kind": "host",
-            "description": null,
+            "description": serde_json::Value::Null,
+            "details": serde_json::Value::Null,
         }));
     }
 
@@ -711,21 +711,27 @@ fn generate_viz_html(graph: &bizgraph::types::BusinessGraph, project_name: &str)
                     "description": props.description,
                     "endpoint_count": props.endpoint_count,
                     "host": host,
+                    "details": serde_json::json!({
+                        "host": host,
+                        "path_prefix": props.path_prefix,
+                        "endpoint_count": props.endpoint_count,
+                    }),
                 }));
                 edges_json.push(serde_json::json!({
                     "from": format!("host:{host}"),
                     "to": bf.id.to_string(),
                     "label": "contains",
+                    "edge_type": "hierarchy",
                 }));
             }
         }
     }
 
-    // Create endpoint nodes
+    // Index nodes by id
     let node_by_id: BTreeMap<uuid::Uuid, &bizgraph::types::BusinessNode> =
         graph.nodes.iter().map(|n| (n.id, n)).collect();
 
-    // Collect contains edges
+    // Collect contains edges: parent → children
     let mut contains_children: BTreeMap<uuid::Uuid, Vec<uuid::Uuid>> = BTreeMap::new();
     for edge in &graph.edges {
         if edge.label == "contains" {
@@ -736,6 +742,7 @@ fn generate_viz_html(graph: &bizgraph::types::BusinessGraph, project_name: &str)
         }
     }
 
+    // Create endpoint nodes with full details
     for node in &graph.nodes {
         if node.kind == BusinessNodeKind::BusinessFunction {
             let ep_ids = contains_children.get(&node.id).map(Vec::as_slice).unwrap_or(&[]);
@@ -744,20 +751,67 @@ fn generate_viz_html(graph: &bizgraph::types::BusinessGraph, project_name: &str)
                     if let BusinessNodeProperties::Endpoint(props) = &ep.properties {
                         let methods = props.methods.join(",");
                         let label = format!("{methods} {}", props.path_template);
+                        let param_names: Vec<&str> = props.parameters.iter().map(|p| p.name.as_str()).collect();
+                        let desc_parts: Vec<String> = vec![
+                            format!("Methods: {methods}"),
+                            format!("Path: {}", props.path_template),
+                            format!("Confidence: {:.0}%", props.confidence * 100.0),
+                            if param_names.is_empty() { String::new() } else { format!("Parameters: {}", param_names.join(", ")) },
+                        ].into_iter().filter(|s| !s.is_empty()).collect();
                         nodes_json.push(serde_json::json!({
                             "id": ep.id.to_string(),
                             "label": label,
                             "kind": "endpoint",
-                            "description": null,
+                            "description": desc_parts.join("\n"),
                             "confidence": props.confidence,
+                            "methods": props.methods,
+                            "path": props.path_template,
+                            "parameters": props.parameters.iter().map(|p| serde_json::json!({
+                                "name": p.name, "location": p.location
+                            })).collect::<Vec<_>>(),
+                            "details": serde_json::json!({
+                                "methods": props.methods,
+                                "path": props.path_template,
+                                "confidence": props.confidence,
+                                "parameters": props.parameters,
+                            }),
                         }));
                         edges_json.push(serde_json::json!({
                             "from": node.id.to_string(),
                             "to": ep.id.to_string(),
                             "label": "contains",
+                            "edge_type": "hierarchy",
                         }));
                     }
                 }
+            }
+        }
+    }
+
+    // Add calls_after edges (sequential flow between endpoints)
+    for edge in &graph.edges {
+        if edge.label == "calls_after" {
+            if node_by_id.contains_key(&edge.source_node_id) && node_by_id.contains_key(&edge.target_node_id) {
+                edges_json.push(serde_json::json!({
+                    "from": edge.source_node_id.to_string(),
+                    "to": edge.target_node_id.to_string(),
+                    "label": "calls_after",
+                    "edge_type": "flow",
+                }));
+            }
+        }
+    }
+
+    // Add data_dependency edges
+    for edge in &graph.edges {
+        if edge.label.starts_with("data_dependency") {
+            if node_by_id.contains_key(&edge.source_node_id) && node_by_id.contains_key(&edge.target_node_id) {
+                edges_json.push(serde_json::json!({
+                    "from": edge.source_node_id.to_string(),
+                    "to": edge.target_node_id.to_string(),
+                    "label": edge.label.clone(),
+                    "edge_type": "dependency",
+                }));
             }
         }
     }
