@@ -178,11 +178,10 @@ pub fn parse_har(har_path: &str, host_filter: Option<&str>) -> Result<Vec<Traffi
             parsed_url.path().to_string()
         };
 
-        let query = if parsed_url.query().is_none_or(|q| q.is_empty()) {
-            None
-        } else {
-            Some(parsed_url.query().unwrap().to_string())
-        };
+        let query = parsed_url
+            .query()
+            .filter(|q| !q.is_empty())
+            .map(|q| q.to_string());
 
         let port = extract_port(&parsed_url);
 

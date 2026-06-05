@@ -32,6 +32,11 @@ pub fn analyze(har_path: &str, host_filter: Option<&str>) -> Result<BusinessGrap
     build_business_graph(&rows)
 }
 
+/// Analyze a HAR file and generate an AI-powered business analysis report.
+///
+/// First identifies business functions via AI, then builds the graph using those
+/// groupings (falling back to URL-based grouping on failure). Finally generates
+/// either a single-shot or deep multi-phase analysis report.
 pub async fn analyze_with_ai_report(
     har_path: &str,
     host_filter: Option<&str>,
@@ -59,6 +64,10 @@ pub async fn analyze_with_ai_report(
     Ok((graph, report))
 }
 
+/// Full analysis pipeline with project persistence.
+///
+/// Parses HAR → builds graph → merges into project DB → runs AI analysis → records history.
+/// Supports incremental analysis: only new endpoints are sent to AI on subsequent runs.
 pub async fn analyze_with_project(
     har_path: &str,
     host_filter: Option<&str>,
@@ -192,13 +201,23 @@ fn build_business_context(identification: &ai::BusinessIdentification) -> String
     lines.join("\n")
 }
 
+/// Load API configuration from `~/.config/bizgraph/config.toml`.
+///
+/// Also checks `BIZGRAPH_API_KEY` env var as fallback for the API key.
+/// Returns `(api_key, model, api_url)`.
 pub fn load_config() -> Result<(String, String, String)> {
     let config = read_config_from_path(config_path_in_home())?;
 
-    let api_key = config
-        .as_ref()
-        .and_then(|config| config.api_key.as_deref())
-        .and_then(normalize_config_value)
+    // Check env var first, then config file
+    let api_key = env::var("BIZGRAPH_API_KEY")
+        .ok()
+        .and_then(|v| normalize_config_value(&v))
+        .or_else(|| {
+            config
+                .as_ref()
+                .and_then(|config| config.api_key.as_deref())
+                .and_then(normalize_config_value)
+        })
         .ok_or(Error::ConfigMissingApiKey)?;
 
     let model = config

@@ -42,6 +42,7 @@ impl Database {
             .map_err(|source| Error::sqlite("failed to open bizgraph database", source))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;
              PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS projects (
                  id TEXT PRIMARY KEY,
@@ -986,5 +987,302 @@ fn _normalize_json_object(value: Value) -> Value {
             Value::Object(ordered)
         }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::*;
+
+    fn in_memory_db() -> Database {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA foreign_keys = ON;
+             CREATE TABLE IF NOT EXISTS projects (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL UNIQUE,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS business_nodes (
+                 id TEXT NOT NULL,
+                 project_id TEXT NOT NULL REFERENCES projects(id),
+                 stable_key TEXT NOT NULL,
+                 label TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 properties TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 PRIMARY KEY(project_id, stable_key)
+             );
+             CREATE TABLE IF NOT EXISTS business_edges (
+                 id TEXT NOT NULL,
+                 project_id TEXT NOT NULL REFERENCES projects(id),
+                 source_node_id TEXT NOT NULL,
+                 target_node_id TEXT NOT NULL,
+                 label TEXT NOT NULL,
+                 properties TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 PRIMARY KEY(project_id, source_node_id, target_node_id, label)
+             );
+             CREATE TABLE IF NOT EXISTS analyses (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT NOT NULL REFERENCES projects(id),
+                 excel_path TEXT,
+                 host_filter TEXT,
+                 row_count INTEGER NOT NULL DEFAULT 0,
+                 new_nodes INTEGER NOT NULL DEFAULT 0,
+                 updated_nodes INTEGER NOT NULL DEFAULT 0,
+                 new_edges INTEGER NOT NULL DEFAULT 0,
+                 skipped_edges INTEGER NOT NULL DEFAULT 0,
+                 ai_report TEXT,
+                 created_at TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        super::ensure_analysis_ai_report_column(&conn).unwrap();
+        super::ensure_analysis_node_snapshot_column(&conn).unwrap();
+        Database {
+            conn: Mutex::new(conn),
+        }
+    }
+
+    #[test]
+    fn create_and_list_projects() {
+        let db = in_memory_db();
+        let p = db.create_project("test-proj").unwrap();
+        assert_eq!(p.name, "test-proj");
+
+        let projects = db.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "test-proj");
+    }
+
+    #[test]
+    fn duplicate_project_name_rejected() {
+        let db = in_memory_db();
+        db.create_project("dup").unwrap();
+        let err = db.create_project("dup").unwrap_err();
+        assert!(matches!(err, Error::ProjectAlreadyExists { .. }));
+    }
+
+    #[test]
+    fn get_project_by_name_and_id() {
+        let db = in_memory_db();
+        let p = db.create_project("lookup").unwrap();
+
+        let by_name = db.get_project_by_name("lookup").unwrap().unwrap();
+        assert_eq!(by_name.id, p.id);
+
+        let by_id = db.get_project(p.id).unwrap();
+        assert_eq!(by_id.name, "lookup");
+    }
+
+    #[test]
+    fn resolve_project_by_name() {
+        let db = in_memory_db();
+        let p = db.create_project("resolve-me").unwrap();
+        let resolved = db.resolve_project("resolve-me").unwrap().unwrap();
+        assert_eq!(resolved.id, p.id);
+    }
+
+    #[test]
+    fn resolve_project_not_found() {
+        let db = in_memory_db();
+        let result = db.resolve_project("nope").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn upsert_node_and_get_graph() {
+        let db = in_memory_db();
+        let p = db.create_project("graph-test").unwrap();
+
+        let node = BusinessNode {
+            id: Uuid::new_v4(),
+            stable_key: "host:example.com".to_string(),
+            label: "example.com".to_string(),
+            kind: BusinessNodeKind::Host,
+            properties: BusinessNodeProperties::Host(BTreeMap::new()),
+        };
+        let changed = db.upsert_node(p.id, &node).unwrap();
+        assert!(changed, "first insert should report changed");
+
+        let changed = db.upsert_node(p.id, &node).unwrap();
+        assert!(!changed, "identical re-insert should not report changed");
+
+        let graph = db.get_graph(p.id).unwrap();
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(graph.nodes[0].stable_key, "host:example.com");
+    }
+
+    #[test]
+    fn upsert_edge_and_get_graph() {
+        let db = in_memory_db();
+        let p = db.create_project("edge-test").unwrap();
+
+        let n1 = BusinessNode {
+            id: Uuid::new_v4(),
+            stable_key: "host:a.com".to_string(),
+            label: "a.com".to_string(),
+            kind: BusinessNodeKind::Host,
+            properties: BusinessNodeProperties::Host(BTreeMap::new()),
+        };
+        let n2 = BusinessNode {
+            id: Uuid::new_v4(),
+            stable_key: "bf:a.com:/api".to_string(),
+            label: "/api".to_string(),
+            kind: BusinessNodeKind::BusinessFunction,
+            properties: BusinessNodeProperties::BusinessFunction(BusinessFunctionProperties {
+                host: "a.com".to_string(),
+                path_prefix: "/api".to_string(),
+                endpoint_count: 0,
+                description: None,
+            }),
+        };
+        db.upsert_node(p.id, &n1).unwrap();
+        db.upsert_node(p.id, &n2).unwrap();
+
+        let edge = BusinessEdge {
+            id: Uuid::new_v4(),
+            source_node_id: n1.id,
+            target_node_id: n2.id,
+            label: "contains".to_string(),
+            properties: serde_json::Value::Object(serde_json::Map::new()),
+        };
+        let changed = db.upsert_edge(p.id, &edge).unwrap();
+        assert!(changed);
+
+        let graph = db.get_graph(p.id).unwrap();
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].label, "contains");
+    }
+
+    #[test]
+    fn merge_graph_creates_nodes_and_edges() {
+        let db = in_memory_db();
+        let p = db.create_project("merge-test").unwrap();
+
+        let graph = BusinessGraph {
+            nodes: vec![
+                BusinessNode {
+                    id: Uuid::new_v4(),
+                    stable_key: "host:x.com".to_string(),
+                    label: "x.com".to_string(),
+                    kind: BusinessNodeKind::Host,
+                    properties: BusinessNodeProperties::Host(BTreeMap::new()),
+                },
+                BusinessNode {
+                    id: Uuid::new_v4(),
+                    stable_key: "ep:GET:x.com:/users".to_string(),
+                    label: "GET /users".to_string(),
+                    kind: BusinessNodeKind::Endpoint,
+                    properties: BusinessNodeProperties::Endpoint(EndpointProperties {
+                            path_template: "/users".to_string(),
+                            methods: vec!["GET".to_string()],
+                            status_codes: vec![200],
+                            request_schema: None,
+                            response_schema: None,
+                            parameters: vec![],
+                            status_profiles: StatusProfiles::default(),
+                            confidence: 1.0,
+                            normalization_notes: vec![],
+                        }),
+                },
+            ],
+            edges: vec![],
+        };
+
+        let stats = db.merge_graph(p.id, &graph).unwrap();
+        assert_eq!(stats.new_nodes, 2);
+        assert_eq!(stats.updated_nodes, 0);
+
+        let saved = db.get_graph(p.id).unwrap();
+        assert_eq!(saved.nodes.len(), 2);
+    }
+
+    #[test]
+    fn record_and_retrieve_analysis() {
+        let db = in_memory_db();
+        let p = db.create_project("analysis-test").unwrap();
+
+        let stats = AnalysisStats {
+            row_count: 10,
+            new_nodes: 5,
+            updated_nodes: 0,
+            new_edges: 4,
+            skipped_edges: 0,
+        };
+        db.record_analysis(
+            p.id,
+            Some("test.har"),
+            None,
+            Some("# Report"),
+            10,
+            &stats,
+            Some("[]"),
+        )
+        .unwrap();
+
+        let latest = db.get_latest_analysis(p.id).unwrap().unwrap();
+        assert_eq!(latest.row_count, 10);
+        assert_eq!(latest.ai_report.as_deref(), Some("# Report"));
+
+        let history = db.get_analysis_history(p.id).unwrap();
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn delete_project_cascades() {
+        let db = in_memory_db();
+        let p = db.create_project("delete-me").unwrap();
+
+        let node = BusinessNode {
+            id: Uuid::new_v4(),
+            stable_key: "host:d.com".to_string(),
+            label: "d.com".to_string(),
+            kind: BusinessNodeKind::Host,
+            properties: BusinessNodeProperties::Host(BTreeMap::new()),
+        };
+        db.upsert_node(p.id, &node).unwrap();
+
+        db.delete_project(p.id).unwrap();
+        assert!(db.get_project(p.id).is_err());
+        assert!(db.get_graph(p.id).unwrap().nodes.is_empty());
+    }
+
+    #[test]
+    fn clear_business_functions() {
+        let db = in_memory_db();
+        let p = db.create_project("clear-bf").unwrap();
+
+        let host = BusinessNode {
+            id: Uuid::new_v4(),
+            stable_key: "host:e.com".to_string(),
+            label: "e.com".to_string(),
+            kind: BusinessNodeKind::Host,
+            properties: BusinessNodeProperties::Host(BTreeMap::new()),
+        };
+        let bf = BusinessNode {
+            id: Uuid::new_v4(),
+            stable_key: "bf:e.com:/api".to_string(),
+            label: "/api".to_string(),
+            kind: BusinessNodeKind::BusinessFunction,
+            properties: BusinessNodeProperties::BusinessFunction(BusinessFunctionProperties {
+                host: "e.com".to_string(),
+                path_prefix: "/api".to_string(),
+                endpoint_count: 1,
+                description: None,
+            }),
+        };
+        db.upsert_node(p.id, &host).unwrap();
+        db.upsert_node(p.id, &bf).unwrap();
+
+        db.clear_business_functions(p.id).unwrap();
+        let graph = db.get_graph(p.id).unwrap();
+        assert_eq!(graph.nodes.len(), 1);
+        assert!(matches!(graph.nodes[0].kind, BusinessNodeKind::Host));
     }
 }

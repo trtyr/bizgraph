@@ -1,6 +1,10 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Serialize)]
 pub struct ChatMessage {
@@ -69,14 +73,21 @@ pub async fn send_chat_request(
     let max_retries = 3;
     let mut last_err = None;
 
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
     for attempt in 0..=max_retries {
         if attempt > 0 {
-            let delay_ms = 1000 * (1u64 << (attempt - 1)); // 1s, 2s, 4s
+            // Exponential backoff with jitter: base 1s, 2s, 4s + random [0, 500ms)
+            let base_ms = 1000u64 * (1u64 << (attempt - 1));
+            let jitter_ms = rand_jitter();
+            let delay_ms = base_ms + jitter_ms;
             eprintln!("  ⏳ Retry {attempt}/{max_retries} (waiting {}ms)...", delay_ms);
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
         }
 
-        let client = reqwest::Client::new();
         let result = client
             .post(api_url)
             .header("Content-Type", "application/json")
@@ -130,4 +141,14 @@ pub async fn send_chat_request(
         body: "all retries exhausted".to_string(),
         url: api_url.to_string(),
     }))
+}
+
+/// Simple jitter: random [0, 500) ms using system time as entropy source.
+fn rand_jitter() -> u64 {
+    use std::time::SystemTime;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    (nanos % 500) as u64
 }

@@ -9,9 +9,13 @@ pub const STABLE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x8cb0f43215db53178f8d2f89
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
+/// Classification of a node in the business graph.
 pub enum BusinessNodeKind {
+    /// A domain/hostname (e.g., `api.example.com`).
     Host,
+    /// A logical business function grouping related endpoints (e.g., "User Management").
     BusinessFunction,
+    /// An individual API endpoint (e.g., `GET /api/v1/users/{id}`).
     Endpoint,
 }
 
@@ -110,8 +114,12 @@ pub enum BusinessNodeProperties {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// A node in the business graph — one of Host, BusinessFunction, or Endpoint.
+///
+/// `id` is deterministically derived from `stable_key` via UUIDv5.
 pub struct BusinessNode {
     pub id: Uuid,
+    /// Deterministic key (e.g., `ep:GET:api.example.com:/users/{id}`). Same input always produces the same key.
     pub stable_key: String,
     pub label: String,
     pub kind: BusinessNodeKind,
@@ -119,6 +127,10 @@ pub struct BusinessNode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// A directed edge in the business graph.
+///
+/// Labels: `contains` (host→bf, bf→endpoint), `calls_after` (sequential flow),
+/// `data_dependency:*` (shared data between requests).
 pub struct BusinessEdge {
     pub id: Uuid,
     pub source_node_id: Uuid,
@@ -128,6 +140,9 @@ pub struct BusinessEdge {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// The core output of bizgraph — a deterministic directed graph of business structure.
+///
+/// Nodes and edges are always sorted by `stable_key` for reproducible serialization.
 pub struct BusinessGraph {
     pub nodes: Vec<BusinessNode>,
     pub edges: Vec<BusinessEdge>,
@@ -170,11 +185,15 @@ pub fn default_properties() -> serde_json::Value {
     serde_json::Value::Object(Default::default())
 }
 
+/// Derive a deterministic UUIDv5 from a stable key.
+///
+/// Same `stable_key` always produces the same `Uuid` — no randomness.
 pub fn deterministic_id(stable_key: &str) -> Uuid {
     Uuid::new_v5(&STABLE_ID_NAMESPACE, stable_key.as_bytes())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// A named project that groups multiple analysis runs.
 pub struct Project {
     pub id: Uuid,
     pub name: String,
@@ -191,6 +210,9 @@ pub struct AnalysisStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// A single analysis run recorded against a project.
+///
+/// Contains the AI report, traffic stats, and a node snapshot for diff comparison.
 pub struct AnalysisRecord {
     pub id: Uuid,
     pub project_id: Uuid,
@@ -208,6 +230,7 @@ pub struct AnalysisRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Complete result of `analyze_with_project` — project info, graph, stats, and optional AI report.
 pub struct AnalysisResult {
     pub project: Project,
     pub graph: BusinessGraph,

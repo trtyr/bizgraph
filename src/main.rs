@@ -74,6 +74,13 @@ enum ProjectAction {
 
 #[tokio::main]
 async fn main() {
+    // Graceful shutdown on Ctrl+C
+    tokio::spawn(async {
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("\n⛔ Interrupted.");
+        std::process::exit(130);
+    });
+
     let cli = Cli::parse();
     match cli.command {
         Command::Analyze {
