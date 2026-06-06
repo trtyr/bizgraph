@@ -9,6 +9,7 @@ use super::chat::{chat_fresh, send_chat_request, ChatMessage, ChatRequest};
 use super::prompts::*;
 use super::summarization::{
     build_cross_domain_summary, build_function_detail, build_graph_overview,
+    build_scoped_subgraph_summary,
     extract_cross_cutting_items, parse_observations_from_response, prioritized_function_names,
     summarize_text,
 };
@@ -159,8 +160,10 @@ pub async fn run_agent(
     for domain in &selected_domains {
         let name = domain.name.clone();
         let detail = build_function_detail(&name, graph);
-        // Phase 2: no history accumulation — each domain gets only its own scoped data
-        let context = build_scoped_turn_context("DOMAIN_DEEP_DIVE", &detail);
+        // Use scoped subgraph: only this domain's nodes/edges, not the full graph
+        let scoped_graph = build_scoped_subgraph_summary(graph, &domain.name);
+        let combined = format!("{detail}\n\n---\n\nScoped graph context:\n{scoped_graph}");
+        let context = build_scoped_turn_context("DOMAIN_DEEP_DIVE", &combined);
         let api_key = api_key.to_string();
         let model = model.to_string();
         let api_url = api_url.to_string();
@@ -672,4 +675,31 @@ fn check_budget(state: &AgentState, new_text: &str, limit: usize) -> Result<()> 
 fn refresh_token_budget(state: &mut AgentState) {
     let serialized = serde_json::to_string(state).unwrap_or_default();
     state.token_budget.used = estimate_tokens(&serialized);
+}
+
+/// Compress conversation history when it exceeds max_messages.
+/// Summarizes older messages into a compact summary, keeps recent messages intact.
+pub fn compress_history(messages: Vec<ChatMessage>, max_messages: usize) -> Vec<ChatMessage> {
+    if messages.len() <= max_messages {
+        return messages;
+    }
+
+    let split = messages.len() - max_messages + 1; // +1 for the summary message
+    let (old, recent) = messages.split_at(split);
+
+    // Build a compact summary of old messages
+    let mut topics = Vec::new();
+    for msg in old {
+        let preview: String = msg.content.chars().take(80).collect();
+        topics.push(format!("[{}] {}", msg.role, preview));
+    }
+    let summary_text = format!(
+        "Previous conversation context:\n{}",
+        topics.join("\n")
+    );
+
+    let mut compressed = Vec::with_capacity(max_messages + 1);
+    compressed.push(ChatMessage::system(summary_text));
+    compressed.extend(recent.iter().cloned());
+    compressed
 }
