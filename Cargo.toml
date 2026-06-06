@@ -1,6 +1,6 @@
 [package]
 name = "bizgraph"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Turn HAR traffic captures into a deterministic business graph"
 license = "MIT"
