@@ -12,7 +12,7 @@ pub use db::Database;
 pub use error::{Error, Result};
 use graph::{build_business_graph, build_business_graph_from_ai, is_static_resource, normalize_path_template};
 use parser::parse_har;
-use types::{AnalysisResult, BusinessGraph};
+use types::{AnalysisResult, BusinessGraph, BusinessNodeProperties};
 
 #[derive(serde::Deserialize)]
 struct Config {
@@ -186,6 +186,106 @@ pub async fn analyze_with_project(
     })
 }
 
+/// Stop words to filter from questions (Chinese + English)
+const STOP_WORDS: &[&str] = &[
+    "的", "是", "在", "了", "和", "与", "什么", "哪些", "怎么", "如何",
+    "吗", "呢", "吧", "啊", "这个", "那个", "有", "没有", "可以",
+    "the", "is", "are", "what", "which", "how", "does", "do", "and", "or", "a", "an",
+];
+
+/// Extract meaningful keywords from a question
+fn extract_keywords(question: &str) -> Vec<String> {
+    question
+        .split(|c: char| c.is_whitespace() || c == '?' || c == '？' || c == ',' || c == '，' || c == '。')
+        .map(|w| w.trim())
+        .filter(|w| w.len() >= 2 && !STOP_WORDS.contains(w))
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+/// Check if a question is broad/complex (needs full context) vs specific (needs scoped context)
+fn is_complex_question(question: &str) -> bool {
+    let q = question.to_lowercase();
+    let complex_markers = [
+        "流程", "业务", "关系", "依赖", "核心", "概述", "整体",
+        "overview", "flow", "relationship", "dependency", "summary", "all",
+        "主要", "全部", "整体", "架构", "分析", "完整",
+    ];
+    complex_markers.iter().any(|m| q.contains(m))
+}
+
+/// Build RAG-style context: match question keywords against graph nodes, return scoped or full context
+fn build_ask_context(graph: &BusinessGraph, question: &str) -> String {
+    let keywords = extract_keywords(question);
+
+    // Always use full context for complex questions
+    if keywords.is_empty() || is_complex_question(question) {
+        return ai::summarization::build_graph_summary(graph);
+    }
+
+    // Match keywords against endpoint nodes
+    let mut matched_ids = std::collections::BTreeSet::new();
+    for node in &graph.nodes {
+        if let BusinessNodeProperties::Endpoint(details) = &node.properties {
+            let haystack = format!(
+                "{} {} {}",
+                node.label.to_lowercase(),
+                details.path_template.to_lowercase(),
+                details.normalization_notes.join(" ").to_lowercase()
+            );
+            if keywords.iter().any(|kw| haystack.contains(kw)) {
+                matched_ids.insert(node.id);
+            }
+        }
+    }
+
+    // Walk edges to find parent functions/hosts
+    for edge in &graph.edges {
+        if edge.label == "contains" && matched_ids.contains(&edge.target_node_id) {
+            matched_ids.insert(edge.source_node_id);
+        }
+    }
+
+    if matched_ids.is_empty() {
+        // No matches — fall back to full context
+        return ai::summarization::build_graph_summary(graph);
+    }
+
+    // Build scoped summary from matched nodes
+    let mut output = String::from("Matched endpoints for your question:\n");
+    output.push_str("| Label | Path | Methods | Params | Confidence |\n");
+    output.push_str("|-------|------|---------|--------|------------|\n");
+
+    let mut count = 0;
+    for node in &graph.nodes {
+        if !matched_ids.contains(&node.id) {
+            continue;
+        }
+        match &node.properties {
+            BusinessNodeProperties::Endpoint(details) => {
+                let methods = details.methods.join(", ");
+                let params = ai::summarization::summarize_parameters(&details.parameters);
+                output.push_str(&format!(
+                    "| {} | {} | {} | {} | {:.2} |\n",
+                    node.label, details.path_template, methods, params, details.confidence
+                ));
+                count += 1;
+            }
+            BusinessNodeProperties::BusinessFunction(details) => {
+                output.push_str(&format!(
+                    "\nBusiness function: {} (host={}, prefix={})\n",
+                    node.label, details.host, details.path_prefix
+                ));
+            }
+            BusinessNodeProperties::Host(_) => {
+                output.push_str(&format!("\nHost: {}\n", node.label));
+            }
+        }
+    }
+
+    output.push_str(&format!("\n({} endpoints matched)\n", count));
+    output
+}
 /// Conversational Q&A: ask a question about a project's traffic data with full context.
 /// Maintains conversation history in SQLite for multi-turn dialogue.
 pub async fn ask(project_name_or_id: &str, question: &str) -> Result<String> {
@@ -196,45 +296,57 @@ pub async fn ask(project_name_or_id: &str, question: &str) -> Result<String> {
         .ok_or_else(|| Error::ProjectNotFound { reference: project_name_or_id.to_string() })?;
 
     let pid = project.id.to_string();
-
-    // Get graph from DB for context
     let graph = db.get_graph(project.id)?;
 
-    // Build compact graph summary as persistent context
-    let graph_context = ai::summarization::build_graph_summary(&graph);
+    // RAG-style context retrieval
+    let graph_context = build_ask_context(&graph, question);
+    let complex = is_complex_question(question);
 
-    // Get conversation history
-    let history = db.get_conversation_history(&pid)?;
+    // Get and compress conversation history
+    let mut history = db.get_conversation_history(&pid)?;
+    history = ai::compress_history(history, 8);
 
     // Build messages
     let mut messages = Vec::new();
-
-    // System prompt with graph context
     let system_prompt = format!(
-        "{}\n\n---\n\nYou are answering questions about the following application's traffic analysis.\nProject: {}\n\nGraph Summary:\n{}\n\nAnswer concisely and precisely. Reference specific endpoint paths, methods, and parameters from the graph.\nIf the information is not available in the graph, say so.",
+        "<identity>\n{}\n</identity>\n\n<reference_data>\nProject: {}\n\n{}\n</reference_data>\n\n<task>\nAnswer the user\'s question concisely and precisely. Reference specific endpoint paths, methods, and parameters.\nIf the information is not available, say so clearly.\n</task>",
         ai::AGENT_IDENTITY_PROMPT,
         project.name,
         graph_context
     );
     messages.push(chat::ChatMessage::system(system_prompt));
-
-    // Add conversation history
     messages.extend(history);
 
-    // Add current question
     let question_msg = question.to_string();
     messages.push(chat::ChatMessage::user(question_msg.clone()));
-
-    // Save user message to DB
     db.add_conversation_message(&pid, "user", &question_msg)?;
 
     // Send to AI
     let response = chat::chat_fresh(messages, &api_key, &model, &api_url, None).await?;
 
-    // Save assistant response to DB
-    db.add_conversation_message(&pid, "assistant", &response)?;
+    // Self-correction: retry with full context if answer is too short for complex questions
+    let final_response = if complex && response.len() < 200 {
+        eprintln!("  ↻ Answer too short for complex question, retrying with full context...");
+        let full_context = ai::summarization::build_graph_summary(&graph);
+        let retry_prompt = format!(
+            "<identity>\n{}\n</identity>\n\n<reference_data>\nProject: {}\n\n{}\n</reference_data>\n\n<task>\nThe user asked: {}\nYour previous answer was too brief. Provide a comprehensive answer with full details.\n</task>",
+            ai::AGENT_IDENTITY_PROMPT,
+            project.name,
+            full_context,
+            question
+        );
+        let mut retry_msgs = vec![chat::ChatMessage::system(retry_prompt)];
+        retry_msgs.push(chat::ChatMessage::user(question_msg.clone()));
+        match chat::chat_fresh(retry_msgs, &api_key, &model, &api_url, None).await {
+            Ok(retry_resp) if retry_resp.len() > response.len() => retry_resp,
+            _ => response,
+        }
+    } else {
+        response
+    };
 
-    Ok(response)
+    db.add_conversation_message(&pid, "assistant", &final_response)?;
+    Ok(final_response)
 }
 
 /// Clear conversation history for a project

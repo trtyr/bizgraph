@@ -9,6 +9,7 @@ use crate::types::BusinessGraph;
 use crate::Result;
 
 pub use prompts::*;
+pub use agent::compress_history;
 
 /// Send the business graph to the configured chat completion API for AI analysis.
 /// Returns a Markdown report.
