@@ -3,3 +3,7 @@ target/
 __pycache__/
 *.db
 data/
+
+# Generated artifacts
+.codegraph/
+graph.html
