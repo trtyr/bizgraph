@@ -22,9 +22,11 @@ CLI + library that parses `.har` files into stable business graphs, persists to 
 ## Quick Start
 
 ```bash
-# Install from source
-git clone https://github.com/trtyr/bizgraph.git
-cd bizgraph
+# Install from crates.io (recommended)
+cargo install bizgraph
+
+# Or install from source
+git clone https://github.com/trtyr/bizgraph.git && cd bizgraph
 cargo install --path .
 
 # Configure AI (optional, enables AI analysis + ask)
