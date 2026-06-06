@@ -93,6 +93,12 @@ pub struct EndpointProperties {
     pub status_profiles: StatusProfiles,
     pub confidence: f64,
     pub normalization_notes: Vec<String>,
+    /// Sampled request headers (up to 3 observations).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_headers: Vec<String>,
+    /// Sampled response bodies (up to 3 observations, truncated).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_bodies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

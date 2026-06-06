@@ -52,6 +52,28 @@ pub fn build_graph_summary(graph: &BusinessGraph) -> String {
                     details.confidence
                 ));
 
+                // Include auth headers if detected
+                for hdr in &details.request_headers {
+                    let lower = hdr.to_lowercase();
+                    if lower.starts_with("authorization")
+                        || lower.starts_with("cookie")
+                        || lower.starts_with("x-api-key")
+                        || lower.starts_with("x-token")
+                    {
+                        lines.push(format!("  auth: {}", hdr));
+                        break;
+                    }
+                }
+                // Include response body sample if available
+                if let Some(body) = details.response_bodies.first() {
+                    let truncated = if body.len() > 500 {
+                        format!("{}...", &body[..500])
+                    } else {
+                        body.clone()
+                    };
+                    lines.push(format!("  response_sample: {}", truncated));
+                }
+
                 if looks_interesting(
                     &node.label,
                     &details.path_template,
@@ -260,6 +282,26 @@ pub fn build_scoped_subgraph_summary(graph: &BusinessGraph, domain_prefix: &str)
                 "| {} | {} | {} | {} | {} | {:.2} |",
                 node.label, details.path_template, methods, params, desc, details.confidence
             ));
+            // Add auth header if detected
+            for hdr in &details.request_headers {
+                let lower = hdr.to_lowercase();
+                if lower.starts_with("authorization")
+                    || lower.starts_with("cookie")
+                    || lower.starts_with("x-api-key")
+                {
+                    endpoint_rows.push(format!("  auth: {}", hdr));
+                    break;
+                }
+            }
+            // Add response body sample
+            if let Some(body) = details.response_bodies.first() {
+                let truncated = if body.len() > 300 {
+                    format!("{}...", &body[..300])
+                } else {
+                    body.clone()
+                };
+                endpoint_rows.push(format!("  response: {}", truncated));
+            }
             if endpoint_rows.len() >= MAX_ENDPOINTS_PER_DOMAIN {
                 endpoint_rows.push("| ... | (truncated) | | | | |".to_string());
                 break;

@@ -920,6 +920,8 @@ fn merge_endpoint_properties(
         },
         confidence: 0.0,
         normalization_notes,
+        request_headers: merge_sorted_unique(existing.request_headers, incoming.request_headers),
+        response_bodies: merge_sorted_unique(existing.response_bodies, incoming.response_bodies),
     };
 
     merged.confidence = recalculate_endpoint_confidence(&merged);
@@ -1243,6 +1245,8 @@ mod tests {
                             status_profiles: StatusProfiles::default(),
                             confidence: 1.0,
                             normalization_notes: vec![],
+                            request_headers: vec![],
+                            response_bodies: vec![],
                         }),
                 },
             ],

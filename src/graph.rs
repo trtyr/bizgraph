@@ -467,6 +467,7 @@ struct EndpointAccumulator {
     observation_count: usize,
     request_samples: Vec<String>,
     request_header_samples: Vec<String>,
+    response_body_samples: Vec<String>,
     query_samples: Vec<String>,
 }
 
@@ -543,6 +544,14 @@ impl EndpointAccumulator {
             self.request_header_samples
                 .push(row.request_headers.clone());
         }
+        if !row.response_body.is_empty() && self.response_body_samples.len() < 3 {
+            let truncated = if row.response_body.len() > 2000 {
+                format!("{}...[truncated]", &row.response_body[..2000])
+            } else {
+                row.response_body.clone()
+            };
+            self.response_body_samples.push(truncated);
+        }
         if let Some(query) = &row.query {
             if !query.is_empty() && self.query_samples.len() < 3 {
                 self.query_samples.push(query.clone());
@@ -571,6 +580,8 @@ impl EndpointAccumulator {
             status_profiles: self.status_profiles.clone(),
             confidence: calculate_confidence(self),
             normalization_notes: self.normalization_notes.iter().cloned().collect(),
+            request_headers: self.request_header_samples.clone(),
+            response_bodies: self.response_body_samples.clone(),
         }
     }
 
