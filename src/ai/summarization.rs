@@ -182,6 +182,167 @@ pub fn build_graph_summary(graph: &BusinessGraph) -> String {
     summary
 }
 
+/// Build a compact summary of only the subgraph relevant to a domain prefix.
+/// Used by Phase 2 domain deep-dives to send focused context instead of the full graph.
+pub fn build_scoped_subgraph_summary(graph: &BusinessGraph, domain_prefix: &str) -> String {
+    let prefix_lower = domain_prefix.to_lowercase();
+
+    // Collect endpoint node IDs that match this domain
+    let mut matched_endpoint_ids = std::collections::BTreeSet::new();
+    let mut matched_function_ids = std::collections::BTreeSet::new();
+    let mut matched_host_ids = std::collections::BTreeSet::new();
+
+    for node in &graph.nodes {
+        match &node.properties {
+            BusinessNodeProperties::Endpoint(details) => {
+                let path_match = details.path_template.to_lowercase().contains(&prefix_lower);
+                let label_match = node.label.to_lowercase().contains(&prefix_lower);
+                if path_match || label_match {
+                    matched_endpoint_ids.insert(node.id);
+                }
+            }
+            BusinessNodeProperties::BusinessFunction(details) => {
+                if details.path_prefix.to_lowercase().contains(&prefix_lower)
+                    || details.host.to_lowercase().contains(&prefix_lower)
+                    || node.label.to_lowercase().contains(&prefix_lower)
+                {
+                    matched_function_ids.insert(node.id);
+                }
+            }
+            BusinessNodeProperties::Host(details) => {
+                if node.label.to_lowercase().contains(&prefix_lower)
+                    || details.keys().any(|k| k.to_lowercase().contains(&prefix_lower))
+                {
+                    matched_host_ids.insert(node.id);
+                }
+            }
+        }
+    }
+
+    // Walk contains edges to find parent functions/hosts of matched endpoints
+    for edge in &graph.edges {
+        if edge.label == "contains" {
+            if matched_endpoint_ids.contains(&edge.target_node_id) {
+                matched_function_ids.insert(edge.source_node_id);
+            }
+            if matched_function_ids.contains(&edge.target_node_id) {
+                matched_host_ids.insert(edge.source_node_id);
+            }
+        }
+    }
+
+    let all_matched: std::collections::BTreeSet<_> = matched_endpoint_ids
+        .iter()
+        .chain(matched_function_ids.iter())
+        .chain(matched_host_ids.iter())
+        .copied()
+        .collect();
+
+    if all_matched.is_empty() {
+        return format!("No nodes matched domain prefix '{}'.", domain_prefix);
+    }
+
+    // Build endpoint table
+    let mut endpoint_rows = Vec::new();
+    for node in &graph.nodes {
+        if !matched_endpoint_ids.contains(&node.id) {
+            continue;
+        }
+        if let BusinessNodeProperties::Endpoint(details) = &node.properties {
+            let methods = details.methods.join(", ");
+            let params = summarize_parameters(&details.parameters);
+            let desc = details
+                .normalization_notes
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            endpoint_rows.push(format!(
+                "| {} | {} | {} | {} | {} | {:.2} |",
+                node.label, details.path_template, methods, params, desc, details.confidence
+            ));
+            if endpoint_rows.len() >= MAX_ENDPOINTS_PER_DOMAIN {
+                endpoint_rows.push("| ... | (truncated) | | | | |".to_string());
+                break;
+            }
+        }
+    }
+
+    // Build function list
+    let mut function_rows = Vec::new();
+    for node in &graph.nodes {
+        if !matched_function_ids.contains(&node.id) {
+            continue;
+        }
+        if let BusinessNodeProperties::BusinessFunction(details) = &node.properties {
+            function_rows.push(format!(
+                "- {} | host={} | prefix={} | endpoints={}",
+                node.label, details.host, details.path_prefix, details.endpoint_count
+            ));
+        }
+    }
+
+    // Build filtered edges (only between matched nodes)
+    let mut edge_rows = Vec::new();
+    let id_to_label: BTreeMap<_, _> = graph
+        .nodes
+        .iter()
+        .map(|n| (n.id, n.label.clone()))
+        .collect();
+    for edge in &graph.edges {
+        if all_matched.contains(&edge.source_node_id)
+            && all_matched.contains(&edge.target_node_id)
+        {
+            let from = id_to_label.get(&edge.source_node_id).map(String::as_str).unwrap_or("?");
+            let to = id_to_label.get(&edge.target_node_id).map(String::as_str).unwrap_or("?");
+            edge_rows.push(format!("| {} | {} | {} |", from, to, edge.label));
+            if edge_rows.len() >= 50 {
+                edge_rows.push("| ... | ... | (truncated) |".to_string());
+                break;
+            }
+        }
+    }
+
+    // Assemble
+    let mut summary = String::new();
+    summary.push_str(&format!("Domain scope: {}\n", domain_prefix));
+    summary.push_str(&format!(
+        "Nodes: {} endpoints, {} business functions, {} hosts\n\n",
+        matched_endpoint_ids.len(), matched_function_ids.len(), matched_host_ids.len()
+    ));
+
+    if !function_rows.is_empty() {
+        summary.push_str("Business functions:\n");
+        for row in &function_rows {
+            summary.push_str(row);
+            summary.push('\n');
+        }
+        summary.push('\n');
+    }
+
+    if !endpoint_rows.is_empty() {
+        summary.push_str("Endpoints:\n");
+        summary.push_str("| Label | Path | Methods | Params | Description | Confidence |\n");
+        summary.push_str("|-------|------|---------|--------|-------------|------------|\n");
+        for row in &endpoint_rows {
+            summary.push_str(row);
+            summary.push('\n');
+        }
+        summary.push('\n');
+    }
+
+    if !edge_rows.is_empty() {
+        summary.push_str("Relationships:\n");
+        summary.push_str("| From | To | Type |\n");
+        summary.push_str("|------|-----|------|\n");
+        for row in &edge_rows {
+            summary.push_str(row);
+            summary.push('\n');
+        }
+    }
+
+    summary
+}
+
 pub fn build_graph_overview(graph: &BusinessGraph) -> String {
     let mut function_lines = Vec::new();
     let mut edge_counts: BTreeMap<&str, usize> = BTreeMap::new();
