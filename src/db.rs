@@ -15,6 +15,7 @@ use crate::types::{
     BusinessNode, BusinessNodeKind, BusinessNodeProperties, EndpointProperties,
     ParameterDescriptor, ParameterKind, Project,
 };
+use crate::ai::chat::ChatMessage;
 
 /// Return `~/.config/bizgraph/`, creating the directory if it does not exist.
 fn global_config_dir() -> Result<PathBuf> {
@@ -82,8 +83,15 @@ impl Database {
                   skipped_edges INTEGER NOT NULL DEFAULT 0,
                   ai_report TEXT,
                   created_at TEXT NOT NULL
-              );",
-        )
+              );
+              CREATE TABLE IF NOT EXISTS conversations (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  project_id TEXT NOT NULL REFERENCES projects(id),
+                  role TEXT NOT NULL,
+                  content TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+              );
+        ")
         .map_err(|source| Error::sqlite("failed to initialize bizgraph database", source))?;
 
         ensure_analysis_ai_report_column(&conn)?;
@@ -655,6 +663,45 @@ impl Database {
         Ok(())
     }
 
+    /// Insert a conversation message (user or assistant)
+    pub fn add_conversation_message(&self, project_id: &str, role: &str, content: &str) -> Result<()> {
+        let c = self.c();
+        c.execute(
+            "INSERT INTO conversations (project_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![project_id, role, content, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Get conversation history for a project, ordered by time
+    pub fn get_conversation_history(&self, project_id: &str) -> Result<Vec<ChatMessage>> {
+        let c = self.c();
+        let mut stmt = c.prepare(
+            "SELECT role, content FROM conversations WHERE project_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![project_id], |row| {
+            Ok(ChatMessage {
+                role: row.get(0)?,
+                content: row.get(1)?,
+            })
+        })?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+        Ok(messages)
+    }
+
+    /// Clear conversation history for a project
+    pub fn clear_conversation(&self, project_id: &str) -> Result<()> {
+        let c = self.c();
+        c.execute(
+            "DELETE FROM conversations WHERE project_id = ?1",
+            rusqlite::params![project_id],
+        )?;
+        Ok(())
+    }
+
     fn c(&self) -> MutexGuard<'_, Connection> {
         self.conn
             .lock()
@@ -1039,8 +1086,15 @@ mod tests {
                  skipped_edges INTEGER NOT NULL DEFAULT 0,
                  ai_report TEXT,
                  created_at TEXT NOT NULL
-             );",
-        )
+             );
+             CREATE TABLE IF NOT EXISTS conversations (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 project_id TEXT NOT NULL REFERENCES projects(id),
+                 role TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 created_at TEXT NOT NULL
+             );
+        ")
         .unwrap();
         super::ensure_analysis_ai_report_column(&conn).unwrap();
         super::ensure_analysis_node_snapshot_column(&conn).unwrap();
@@ -1284,5 +1338,64 @@ mod tests {
         let graph = db.get_graph(p.id).unwrap();
         assert_eq!(graph.nodes.len(), 1);
         assert!(matches!(graph.nodes[0].kind, BusinessNodeKind::Host));
+    }
+
+    #[test]
+    fn conversation_roundtrip() {
+        let db = in_memory_db();
+        let p = db.create_project("conv-test").unwrap();
+
+        // Empty history initially
+        let pid = p.id.to_string();
+        let history = db.get_conversation_history(&pid).unwrap();
+        assert!(history.is_empty());
+
+        // Add messages
+        db.add_conversation_message(&pid, "user", "What businesses exist?").unwrap();
+        db.add_conversation_message(&pid, "assistant", "There are 5 business domains.").unwrap();
+        db.add_conversation_message(&pid, "user", "Tell me about auth.").unwrap();
+
+        // Verify history
+        let history = db.get_conversation_history(&pid).unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[0].content, "What businesses exist?");
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[1].content, "There are 5 business domains.");
+        assert_eq!(history[2].role, "user");
+        assert_eq!(history[2].content, "Tell me about auth.");
+    }
+
+    #[test]
+    fn conversation_isolation_between_projects() {
+        let db = in_memory_db();
+        let p1 = db.create_project("proj-a").unwrap();
+        let p2 = db.create_project("proj-b").unwrap();
+
+        let pid1 = p1.id.to_string();
+        let pid2 = p2.id.to_string();
+        db.add_conversation_message(&pid1, "user", "Question for A").unwrap();
+        db.add_conversation_message(&pid2, "user", "Question for B").unwrap();
+
+        let h1 = db.get_conversation_history(&pid1).unwrap();
+        let h2 = db.get_conversation_history(&pid2).unwrap();
+        assert_eq!(h1.len(), 1);
+        assert_eq!(h2.len(), 1);
+        assert_eq!(h1[0].content, "Question for A");
+        assert_eq!(h2[0].content, "Question for B");
+    }
+
+    #[test]
+    fn conversation_clear() {
+        let db = in_memory_db();
+        let p = db.create_project("clear-test").unwrap();
+
+        let pid = p.id.to_string();
+        db.add_conversation_message(&pid, "user", "Hello").unwrap();
+        db.add_conversation_message(&pid, "assistant", "Hi there").unwrap();
+        assert_eq!(db.get_conversation_history(&pid).unwrap().len(), 2);
+
+        db.clear_conversation(&pid).unwrap();
+        assert!(db.get_conversation_history(&pid).unwrap().is_empty());
     }
 }

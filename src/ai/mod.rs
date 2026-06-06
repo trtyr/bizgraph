@@ -1,8 +1,8 @@
 mod agent;
 mod business;
-mod chat;
+pub mod chat;
 mod prompts;
-mod summarization;
+pub mod summarization;
 
 pub use business::{identify_business_functions, BusinessFunctionGroup, BusinessIdentification};
 use crate::types::BusinessGraph;

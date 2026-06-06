@@ -36,6 +36,19 @@ enum Command {
         #[command(subcommand)]
         action: ProjectAction,
     },
+    /// Ask a question about a project traffic data (conversational, with context)
+    Ask {
+        /// The question to ask
+        question: String,
+
+        /// Project name or ID
+        #[arg(long = "project", short = 'p')]
+        project: String,
+
+        /// Clear conversation history before asking
+        #[arg(long, help = "Start a fresh conversation")]
+        clear: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -418,6 +431,22 @@ async fn main() {
             if let Err(error) = outcome {
                 eprintln!("Error: {error}");
                 std::process::exit(1);
+            }
+        }
+        Command::Ask { question, project, clear } => {
+            if clear {
+                if let Err(e) = bizgraph::clear_conversation(&project) {
+                    eprintln!("Warning: could not clear conversation: {e}");
+                } else {
+                    println!("Conversation history cleared.");
+                }
+            }
+            match bizgraph::ask(&project, &question).await {
+                Ok(answer) => println!("{}", answer),
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
             }
         }
     }

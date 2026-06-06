@@ -7,7 +7,7 @@ pub mod types;
 
 use std::{env, fs, path::PathBuf};
 
-use ai::{analyze_with_ai, analyze_with_ai_deep, identify_business_functions, AGENT_STATE_TOKEN_LIMIT};
+use ai::{analyze_with_ai, analyze_with_ai_deep, chat, identify_business_functions, AGENT_STATE_TOKEN_LIMIT};
 pub use db::Database;
 pub use error::{Error, Result};
 use graph::{build_business_graph, build_business_graph_from_ai, is_static_resource, normalize_path_template};
@@ -186,6 +186,65 @@ pub async fn analyze_with_project(
     })
 }
 
+/// Conversational Q&A: ask a question about a project's traffic data with full context.
+/// Maintains conversation history in SQLite for multi-turn dialogue.
+pub async fn ask(project_name_or_id: &str, question: &str) -> Result<String> {
+    let config = load_config()?;
+    let (api_key, model, api_url) = config;
+    let db = db::Database::open_default()?;
+    let project = db.resolve_project(project_name_or_id)?
+        .ok_or_else(|| Error::ProjectNotFound { reference: project_name_or_id.to_string() })?;
+
+    let pid = project.id.to_string();
+
+    // Get graph from DB for context
+    let graph = db.get_graph(project.id)?;
+
+    // Build compact graph summary as persistent context
+    let graph_context = ai::summarization::build_graph_summary(&graph);
+
+    // Get conversation history
+    let history = db.get_conversation_history(&pid)?;
+
+    // Build messages
+    let mut messages = Vec::new();
+
+    // System prompt with graph context
+    let system_prompt = format!(
+        "{}\n\n---\n\nYou are answering questions about the following application's traffic analysis.\nProject: {}\n\nGraph Summary:\n{}\n\nAnswer concisely and precisely. Reference specific endpoint paths, methods, and parameters from the graph.\nIf the information is not available in the graph, say so.",
+        ai::AGENT_IDENTITY_PROMPT,
+        project.name,
+        graph_context
+    );
+    messages.push(chat::ChatMessage::system(system_prompt));
+
+    // Add conversation history
+    messages.extend(history);
+
+    // Add current question
+    let question_msg = question.to_string();
+    messages.push(chat::ChatMessage::user(question_msg.clone()));
+
+    // Save user message to DB
+    db.add_conversation_message(&pid, "user", &question_msg)?;
+
+    // Send to AI
+    let response = chat::chat_fresh(messages, &api_key, &model, &api_url, None).await?;
+
+    // Save assistant response to DB
+    db.add_conversation_message(&pid, "assistant", &response)?;
+
+    Ok(response)
+}
+
+/// Clear conversation history for a project
+pub fn clear_conversation(project_name_or_id: &str) -> Result<()> {
+    let db = db::Database::open_default()?;
+    let project = db.resolve_project(project_name_or_id)?
+        .ok_or_else(|| Error::ProjectNotFound { reference: project_name_or_id.to_string() })?;
+    db.clear_conversation(&project.id.to_string())?;
+    Ok(())
+}
 /// Build a human-readable context string from business identification for the deep analysis agent.
 fn build_business_context(identification: &ai::BusinessIdentification) -> String {
     let mut lines = Vec::new();
